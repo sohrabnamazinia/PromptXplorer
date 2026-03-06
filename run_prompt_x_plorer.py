@@ -10,7 +10,7 @@ from datetime import datetime
 from data_model.load_data import DataLoader
 from preprocessing.clusterer import Clustering
 from preprocessing.embedding import Embedding
-from algorithms.sequence_construction import RandomWalk
+from algorithms.sequence_construction import RandomWalk, IPF
 from algorithms.k_set_coverage import KSetCoverage
 from algorithms.prompt_selector import IndividualPromptSelector
 from algorithms.sequence_ordering import OrderSequence
@@ -36,6 +36,9 @@ class TeeOutput:
 
 
 def main():
+    # Small-scale run (quick test):
+    #   python run_prompt_x_plorer.py --n 50 --n_clusters_primary 3 --n_clusters_secondary 5 --phi 2 --large_k 10 --small_k 3 --top_l 3
+    # With IPF: add --sequence_algorithm ipf (optional: --ipf_degree 2).
     parser = argparse.ArgumentParser(description="Run PromptXplorer end-to-end")
     
     # Dataset parameters
@@ -56,12 +59,17 @@ def main():
                         help="Number of clusters for secondary prompts")
     
     # Sequence construction parameters
+    parser.add_argument("--sequence_algorithm", type=str, default="random_walk",
+                        choices=["random_walk", "ipf"],
+                        help="Sequence construction algorithm: random_walk or ipf. Default: random_walk")
+    parser.add_argument("--ipf_degree", type=int, default=2,
+                        help="IPF constraint degree (1=singletons, 2=pairs, 3=triples, ...). Used only if sequence_algorithm=ipf. Default: 2")
     parser.add_argument("--user_input", type=str, default="Create a portrait of a famous person",
                         help="User input query")
     parser.add_argument("--phi", type=int, default=4,
                         help="Number of secondary classes in each sequence")
     parser.add_argument("--large_k", type=int, default=20,
-                        help="Number of sequences to generate in random walk")
+                        help="Number of sequences to generate (random walk or IPF top-k)")
     parser.add_argument("--small_k", type=int, default=5,
                         help="Number of sequences to select in k-set coverage")
     
@@ -108,9 +116,11 @@ def main():
         tee.write(f"Clustering algorithm: {args.clustering_algorithm}\n")
         tee.write(f"Primary clusters: {args.n_clusters_primary}\n")
         tee.write(f"Secondary clusters: {args.n_clusters_secondary}\n")
+        tee.write(f"Sequence algorithm: {args.sequence_algorithm}\n")
+        tee.write(f"IPF degree: {args.ipf_degree}\n")
         tee.write(f"User input: {args.user_input}\n")
         tee.write(f"Phi (secondary classes per sequence): {args.phi}\n")
-        tee.write(f"Large K (random walk sequences): {args.large_k}\n")
+        tee.write(f"Large K (sequences): {args.large_k}\n")
         tee.write(f"Small K (selected sequences): {args.small_k}\n")
         tee.write(f"Top L (RAG candidates): {args.top_l}\n")
         tee.write(f"Save PromptManager: {args.save_prompt_manager}\n")
@@ -158,17 +168,22 @@ def main():
         embedding.embed()
         execution_times['Embedding'] = time.time() - phase_start
         
-        # Phase 3.1: Random Walk
+        # Phase 3.1: Sequence construction (Random Walk or IPF)
         phase_start = time.time()
+        phase_name = "IPF" if args.sequence_algorithm == "ipf" else "Random Walk"
         print("\n" + "=" * 80)
-        print("Phase 3.1: Random Walk...")
+        print(f"Phase 3.1: Sequence construction ({phase_name})...")
         print("=" * 80)
-        random_walk = RandomWalk(pm)
-        composite_class_sequences = random_walk.random_walk_iter(args.user_input, args.phi, args.large_k)
+        if args.sequence_algorithm == "ipf":
+            ipf = IPF(pm, degree=args.ipf_degree)
+            composite_class_sequences = ipf.run(args.user_input, args.phi, args.large_k)
+        else:
+            random_walk = RandomWalk(pm)
+            composite_class_sequences = random_walk.random_walk_iter(args.user_input, args.phi, args.large_k)
         print(f"Generated {len(composite_class_sequences)} composite class sequences:")
         for i, sequence in enumerate(composite_class_sequences, 1):
             print(f"  Sequence {i}: Primary={sequence[0]}, Secondaries={sequence[1:]}")
-        execution_times['Phase 3.1: Random Walk'] = time.time() - phase_start
+        execution_times[f'Phase 3.1: {phase_name}'] = time.time() - phase_start
         
         # Phase 3.2: K-Set Coverage
         phase_start = time.time()
