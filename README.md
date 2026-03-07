@@ -102,17 +102,9 @@ This repository implements the PromptXplorer framework, which constructs ordered
 ### Phase 3: Algorithms (`algorithms/` folder)
 
 **3.1. Sequence Construction (`algorithms/sequence_construction.py`)**
-- Simple interface/base class for sequence construction algorithms
-- `IPF` class (inherits from interface):
-  - Build pairwise probability matrices from frequent itemsets
-  - Implement IPF algorithm (with reference to Dr. Das paper optimizations)
-  - Generate top-k composite class sequences of specific length
-  - Pruning bounds for efficiency
-- `RandomWalk` class (inherits from interface):
-  - Build directed graph from association rules (confidence as edge weights)
-  - Implement random walk from primary class
-  - Gelman-Rubin convergence checking
-  - **First LLM Integration**: Check confidence threshold, use LLM if below threshold
+- Two alternatives; choose via `--sequence_algorithm` in the runner.
+- **`RandomWalk`**: LLM selects primary class; then support-weighted sampling over consecutive secondary classes to generate `large_k` class sequences.
+- **`IPF` (Iterative Proportional Fitting)**: Fits a distribution over all length-φ permutations of secondary classes to match observed constraint marginals from the data (degree-2 = consecutive pairs; degree-3 = consecutive triples when `--ipf_degree 3`). After convergence, returns top-`large_k` sequences by probability. Same-class pairs are excluded (outcomes are permutations). Run with IPF: `--sequence_algorithm ipf`; optional: `--ipf_degree 2` (or 3).
 
 **3.2. Representative Selection (`algorithms/representative_selection.py`)**
 - `KSetCoverage` class:
@@ -209,9 +201,9 @@ PromptXplorer-/
 ## Algorithmic Pipeline Summary
 
 1. **Cluster satellite prompts** (complementary prompts)
-2. **Create sequences of clusters (classes)**:
-   - IPF: Ordered pairwise probabilities → estimate top chains with highest joint probability
-   - Random Walk: Assign class to primary → initiate random walk → get sequences
+2. **Create sequences of clusters (classes)** (choose one):
+   - **IPF**: Fit distribution to degree-2 (and optionally degree-3) pair/triple marginals; return top-k sequences by probability.
+   - **Random Walk**: Assign class to primary (LLM) → support-weighted random walk → get sequences.
      - Gelman-Rubin for convergence
      - **First LLM use**: If confidence below threshold
 3. **Convert cluster sequences → individual prompt sequences** (each sequence independently)
@@ -229,6 +221,5 @@ PromptXplorer-/
 ## Remaining Tasks
 
 1. **Fix DBSCAN and HDBSCAN clustering algorithms**: Currently implemented but may need debugging/refinement
-2. **Implement IPF (Iterative Proportional Filtering) algorithm**: For sequence construction as an alternative to Random Walk
-3. **Implement confidence-based LLM helper in Random Walk**: Track confidence values for transitions (primary→secondary and secondary→secondary). When confidence is below a threshold, use LLM to help decide which node to go to next, rather than relying solely on support values
-4. **Implement stochastic coverage in k-set coverage**: In each iteration of the greedy algorithm, instead of considering all possible sequences, sample p of them and select the best from the sampled set. This improves efficiency for large sets of sequences
+2. **Implement confidence-based LLM helper in Random Walk**: Track confidence values for transitions (primary→secondary and secondary→secondary). When confidence is below a threshold, use LLM to help decide which node to go to next, rather than relying solely on support values
+3. **Implement stochastic coverage in k-set coverage**: In each iteration of the greedy algorithm, instead of considering all possible sequences, sample p of them and select the best from the sampled set. This improves efficiency for large sets of sequences

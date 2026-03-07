@@ -64,6 +64,8 @@ def main():
                         help="Sequence construction algorithm: random_walk or ipf. Default: random_walk")
     parser.add_argument("--ipf_degree", type=int, default=2,
                         help="IPF constraint degree (1=singletons, 2=pairs, 3=triples, ...). Used only if sequence_algorithm=ipf. Default: 2")
+    parser.add_argument("--ipf_use_degree1", type=lambda x: x.lower() == 'true', default=False,
+                        help="If true, IPF uses degree-1 constraints (can cause non-convergence). Default: False")
     parser.add_argument("--user_input", type=str, default="Create a portrait of a famous person",
                         help="User input query")
     parser.add_argument("--phi", type=int, default=4,
@@ -118,6 +120,7 @@ def main():
         tee.write(f"Secondary clusters: {args.n_clusters_secondary}\n")
         tee.write(f"Sequence algorithm: {args.sequence_algorithm}\n")
         tee.write(f"IPF degree: {args.ipf_degree}\n")
+        tee.write(f"IPF use_degree1: {args.ipf_use_degree1}\n")
         tee.write(f"User input: {args.user_input}\n")
         tee.write(f"Phi (secondary classes per sequence): {args.phi}\n")
         tee.write(f"Large K (sequences): {args.large_k}\n")
@@ -175,7 +178,7 @@ def main():
         print(f"Phase 3.1: Sequence construction ({phase_name})...")
         print("=" * 80)
         if args.sequence_algorithm == "ipf":
-            ipf = IPF(pm, degree=args.ipf_degree)
+            ipf = IPF(pm, degree=args.ipf_degree, use_degree1=args.ipf_use_degree1)
             composite_class_sequences = ipf.run(args.user_input, args.phi, args.large_k)
         else:
             random_walk = RandomWalk(pm)
