@@ -196,7 +196,7 @@ class IPF:
         self,
         prompt_manager: PromptManager,
         degree: int = 2,
-        max_iter: int = 1000000,
+        max_iter: int = 50000,
         tol: float = 1e-6,
         use_degree1: bool = False,
     ):

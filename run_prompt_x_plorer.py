@@ -36,9 +36,10 @@ class TeeOutput:
 
 
 def main():
-    # Small-scale run (quick test):
+    # Small-scale run (quick test), with random_walk (default):
     #   python run_prompt_x_plorer.py --n 50 --n_clusters_primary 3 --n_clusters_secondary 5 --phi 2 --large_k 10 --small_k 3 --top_l 3
-    # With IPF: add --sequence_algorithm ipf (optional: --ipf_degree 2).
+    # Small-scale run with IPF:
+    #   python run_prompt_x_plorer.py --n 50 --n_clusters_primary 3 --n_clusters_secondary 5 --phi 2 --large_k 10 --small_k 3 --top_l 3 --sequence_algorithm ipf
     parser = argparse.ArgumentParser(description="Run PromptXplorer end-to-end")
     
     # Dataset parameters
@@ -64,6 +65,8 @@ def main():
                         help="Sequence construction algorithm: random_walk or ipf. Default: random_walk")
     parser.add_argument("--ipf_degree", type=int, default=2,
                         help="IPF constraint degree (1=singletons, 2=pairs, 3=triples, ...). Used only if sequence_algorithm=ipf. Default: 2")
+    parser.add_argument("--ipf_max_iter", type=int, default=400,
+                        help="IPF max iterations. Used only if sequence_algorithm=ipf. Default: 400")
     parser.add_argument("--ipf_use_degree1", type=lambda x: x.lower() == 'true', default=False,
                         help="If true, IPF uses degree-1 constraints (can cause non-convergence). Default: False")
     parser.add_argument("--user_input", type=str, default="Create a portrait of a famous person",
@@ -120,6 +123,7 @@ def main():
         tee.write(f"Secondary clusters: {args.n_clusters_secondary}\n")
         tee.write(f"Sequence algorithm: {args.sequence_algorithm}\n")
         tee.write(f"IPF degree: {args.ipf_degree}\n")
+        tee.write(f"IPF max_iter: {args.ipf_max_iter}\n")
         tee.write(f"IPF use_degree1: {args.ipf_use_degree1}\n")
         tee.write(f"User input: {args.user_input}\n")
         tee.write(f"Phi (secondary classes per sequence): {args.phi}\n")
@@ -178,7 +182,7 @@ def main():
         print(f"Phase 3.1: Sequence construction ({phase_name})...")
         print("=" * 80)
         if args.sequence_algorithm == "ipf":
-            ipf = IPF(pm, degree=args.ipf_degree, use_degree1=args.ipf_use_degree1)
+            ipf = IPF(pm, degree=args.ipf_degree, max_iter=args.ipf_max_iter, use_degree1=args.ipf_use_degree1)
             composite_class_sequences = ipf.run(args.user_input, args.phi, args.large_k)
         else:
             random_walk = RandomWalk(pm)
