@@ -1,0 +1,9 @@
+phi,dataset_distinct_classes,pool_distinct_classes,coverage_greedy_count,coverage_stochastic_count,coverage_greedy_pct_of_dataset,coverage_stochastic_pct_of_dataset,small_k,stochastic_sample_size
+1,10,3,3,3,30.0,30.0,5,5
+2,10,4,4,4,40.0,40.0,5,5
+3,10,10,9,7,90.0,70.0,5,5
+4,10,10,10,8,100.0,80.0,5,5
+5,10,10,10,8,100.0,80.0,5,5
+6,10,10,10,9,100.0,90.0,5,5
+7,10,10,10,9,100.0,90.0,5,5
+8,10,10,10,9,100.0,90.0,5,5

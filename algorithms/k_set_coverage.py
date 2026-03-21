@@ -4,6 +4,8 @@ K-set coverage algorithm for selecting representative sequences.
 
 import sys
 import os
+import numpy as np
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data_model.data_models import PromptManager
@@ -79,5 +81,51 @@ class KSetCoverage:
                     break
         
         # Store result in prompt manager
+        self.prompt_manager.k_class_sequences = I
+        return I
+
+    def run_stochastic_coverage(self, k: int, sample_size: int, rng=None):
+        """
+        Greedy k-set coverage with stochastic candidate pool: at each step, sample
+        ``sample_size`` sequences uniformly from remaining candidates and pick the
+        one with maximum coverage gain.
+
+        Args:
+            k: Target number of sequences to select
+            sample_size: Number of candidates to sample each iteration (>= 1)
+            rng: numpy Generator or None for default_rng()
+
+        Returns:
+            List of k selected composite class sequences
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+        sample_size = max(1, int(sample_size))
+
+        if k >= len(self.k_large_class_sequences):
+            self.prompt_manager.k_class_sequences = list(self.k_large_class_sequences)
+            return self.prompt_manager.k_class_sequences
+
+        I = []
+
+        def coverage_gain(sequence):
+            sequence_classes = set(sequence)
+            covered = set()
+            for s in I:
+                covered.update(s)
+            return len(sequence_classes - covered)
+
+        for _ in range(k):
+            candidates = [s for s in self.k_large_class_sequences if s not in I]
+            if not candidates:
+                break
+            n_sample = min(sample_size, len(candidates))
+            idx = rng.choice(len(candidates), size=n_sample, replace=False)
+            pool = [candidates[i] for i in idx]
+            best_sequence = max(pool, key=coverage_gain)
+            if coverage_gain(best_sequence) == 0 and len(I) < k:
+                best_sequence = candidates[rng.integers(len(candidates))]
+            I.append(best_sequence)
+
         self.prompt_manager.k_class_sequences = I
         return I

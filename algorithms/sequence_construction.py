@@ -15,7 +15,7 @@ from llm.llm_interface import LLMInterface
 
 def _select_primary_class_for_sequence(prompt_manager: PromptManager, llm_interface: LLMInterface, user_input: str):
     """
-    Uses LLM to choose primary class from user input. Shared by RandomWalk and IPF.
+    Uses LLM to choose primary class from user input. Shared by RandomWalk, WalkWithPartner, and IPF.
     Returns primary class index or None.
     """
     primary_prompts = prompt_manager.get_all_primary_prompts()
@@ -182,6 +182,209 @@ class RandomWalk:
         
         chosen = np.random.choice(next_secondary_classes, p=probabilities)
         return chosen
+
+
+def _all_secondary_class_indices(prompt_manager: PromptManager):
+    s = set()
+    for cp in prompt_manager.composite_prompts:
+        for sec in cp.secondaries:
+            if sec.class_obj:
+                s.add(sec.class_obj.index)
+    return sorted(s)
+
+
+def _primary_outgoing_support_totals(prompt_manager: PromptManager):
+    """Total observed support mass leaving each primary class (sum over edges in matrix)."""
+    sup = getattr(prompt_manager, "primary_to_secondary_support", None) or {}
+    totals = {}
+    for (p, _s), v in sup.items():
+        totals[p] = totals.get(p, 0) + int(v)
+    return totals
+
+
+def _secondary_outgoing_support_totals(prompt_manager: PromptManager):
+    """Total observed support mass leaving each secondary class."""
+    sup = getattr(prompt_manager, "secondary_to_secondary_support", None) or {}
+    totals = {}
+    for (a, _b), v in sup.items():
+        totals[a] = totals.get(a, 0) + int(v)
+    return totals
+
+
+def _secondary_class_context_lines(prompt_manager: PromptManager):
+    """class_index -> one-line description for LLM."""
+    lines = {}
+    for cp in prompt_manager.composite_prompts:
+        for sec in cp.secondaries:
+            if sec.class_obj and sec.class_obj.index not in lines:
+                lines[sec.class_obj.index] = sec.class_obj.description or f"class {sec.class_obj.index}"
+    return lines
+
+
+class WalkWithPartner:
+    """
+    Like RandomWalk, but at each step if the current node's total outgoing support is in the
+    bottom ``llm_usage_percent`` of all nodes of that type (primary vs secondary), use the LLM
+    to pick the next secondary class; otherwise sample from the same support-weighted distribution
+    as RandomWalk (including 0.1 pseudo-mass for missing edges).
+    """
+
+    def __init__(self, prompt_manager: PromptManager, llm_usage_percent=None, rng=None):
+        """
+        Args:
+            prompt_manager: PromptManager with support matrices
+            llm_usage_percent: float in [0, 100]. Bottom this % of nodes (by outgoing support)
+                use LLM for the next step. 0 = never LLM on transitions, 100 = always LLM.
+                None defaults to 25.0
+            rng: optional numpy Generator for reproducibility
+        """
+        self.prompt_manager = prompt_manager
+        self.llm_interface = LLMInterface()
+        if llm_usage_percent is None:
+            self.llm_usage_percent = 25.0
+        else:
+            self.llm_usage_percent = float(llm_usage_percent)
+        self.llm_usage_percent = max(0.0, min(100.0, self.llm_usage_percent))
+        self.rng = rng if rng is not None else np.random.default_rng()
+
+        p_tot = _primary_outgoing_support_totals(prompt_manager)
+        s_tot = _secondary_outgoing_support_totals(prompt_manager)
+        self._primary_totals_list = list(p_tot.values()) if p_tot else [0]
+        self._secondary_totals_list = list(s_tot.values()) if s_tot else [0]
+        self._primary_totals_by_class = p_tot
+        self._secondary_totals_by_class = s_tot
+        self._secondary_lines = _secondary_class_context_lines(prompt_manager)
+
+    def _outgoing_primary(self, primary_class: int) -> int:
+        return int(self._primary_totals_by_class.get(primary_class, 0))
+
+    def _outgoing_secondary(self, secondary_class: int) -> int:
+        return int(self._secondary_totals_by_class.get(secondary_class, 0))
+
+    def _use_llm_for_primary_node(self, primary_class: int) -> bool:
+        if self.llm_usage_percent <= 0:
+            return False
+        if self.llm_usage_percent >= 100:
+            return True
+        if not self._primary_totals_list:
+            return True
+        thresh = float(np.percentile(self._primary_totals_list, self.llm_usage_percent))
+        return self._outgoing_primary(primary_class) <= thresh
+
+    def _use_llm_for_secondary_node(self, secondary_class: int) -> bool:
+        if self.llm_usage_percent <= 0:
+            return False
+        if self.llm_usage_percent >= 100:
+            return True
+        if not self._secondary_totals_list:
+            return True
+        thresh = float(np.percentile(self._secondary_totals_list, self.llm_usage_percent))
+        return self._outgoing_secondary(secondary_class) <= thresh
+
+    def _support_sample_primary_secondary(self, primary_class: int):
+        """Same sampling as RandomWalk.walk_primary_secondary."""
+        all_secondary_classes = _all_secondary_class_indices(self.prompt_manager)
+        if not all_secondary_classes:
+            return None
+        candidates = {}
+        for sec_class in all_secondary_classes:
+            if self.prompt_manager.primary_to_secondary_support:
+                support = self.prompt_manager.primary_to_secondary_support.get(
+                    (primary_class, sec_class), 0.1
+                )
+            else:
+                support = 0.1
+            candidates[sec_class] = support
+        secondary_classes = list(candidates.keys())
+        weights = np.array([candidates[c] for c in secondary_classes], dtype=float)
+        weights /= weights.sum()
+        return int(self.rng.choice(secondary_classes, p=weights))
+
+    def _support_sample_secondary_secondary(self, secondary_class: int):
+        all_secondary_classes = _all_secondary_class_indices(self.prompt_manager)
+        if not all_secondary_classes:
+            return None
+        candidates = {}
+        for sec_class in all_secondary_classes:
+            if self.prompt_manager.secondary_to_secondary_support:
+                support = self.prompt_manager.secondary_to_secondary_support.get(
+                    (secondary_class, sec_class), 0.1
+                )
+            else:
+                support = 0.1
+            candidates[sec_class] = support
+        next_secondary_classes = list(candidates.keys())
+        weights = np.array([candidates[c] for c in next_secondary_classes], dtype=float)
+        weights /= weights.sum()
+        return int(self.rng.choice(next_secondary_classes, p=weights))
+
+    def _candidates_context_primary(self, primary_class: int) -> str:
+        lines = []
+        for sec in _all_secondary_class_indices(self.prompt_manager):
+            sup = 0
+            if self.prompt_manager.primary_to_secondary_support:
+                sup = self.prompt_manager.primary_to_secondary_support.get((primary_class, sec), 0)
+            desc = self._secondary_lines.get(sec, str(sec))
+            lines.append(f"- Class {sec}: support={sup}, description={desc}")
+        return "\n".join(lines)
+
+    def _candidates_context_secondary(self, secondary_class: int) -> str:
+        lines = []
+        for sec in _all_secondary_class_indices(self.prompt_manager):
+            sup = 0
+            if self.prompt_manager.secondary_to_secondary_support:
+                sup = self.prompt_manager.secondary_to_secondary_support.get(
+                    (secondary_class, sec), 0
+                )
+            desc = self._secondary_lines.get(sec, str(sec))
+            lines.append(f"- Class {sec}: support={sup}, description={desc}")
+        return "\n".join(lines)
+
+    def walk_primary_secondary(self, user_input: str, primary_class: int):
+        if self._use_llm_for_primary_node(primary_class):
+            ctx = self._candidates_context_primary(primary_class)
+            idx = self.llm_interface.select_next_secondary_class_walk_partner(
+                user_input, "primary", primary_class, ctx
+            )
+            all_sec = set(_all_secondary_class_indices(self.prompt_manager))
+            if idx is not None and idx in all_sec:
+                return idx
+        return self._support_sample_primary_secondary(primary_class)
+
+    def walk_secondary_secondary(self, user_input: str, secondary_class: int):
+        if self._use_llm_for_secondary_node(secondary_class):
+            ctx = self._candidates_context_secondary(secondary_class)
+            idx = self.llm_interface.select_next_secondary_class_walk_partner(
+                user_input, "secondary", secondary_class, ctx
+            )
+            all_sec = set(_all_secondary_class_indices(self.prompt_manager))
+            if idx is not None and idx in all_sec:
+                return idx
+        return self._support_sample_secondary_secondary(secondary_class)
+
+    def walk(self, user_input: str, phi: int):
+        primary_class = _select_primary_class_for_sequence(
+            self.prompt_manager, self.llm_interface, user_input
+        )
+        secondary_classes = []
+        first_secondary = self.walk_primary_secondary(user_input, primary_class)
+        secondary_classes.append(first_secondary)
+        current_secondary = first_secondary
+        for _ in range(phi - 1):
+            nxt = self.walk_secondary_secondary(user_input, current_secondary)
+            secondary_classes.append(nxt)
+            current_secondary = nxt
+        return [primary_class] + secondary_classes
+
+    def walk_iter(self, user_input: str, phi: int, large_k: int):
+        sequences = []
+        for _ in range(large_k):
+            sequences.append(self.walk(user_input, phi))
+        return sequences
+
+    def random_walk_iter(self, user_input: str, phi: int, large_k: int):
+        """Same API as RandomWalk.random_walk_iter."""
+        return self.walk_iter(user_input, phi, large_k)
 
 
 class IPF:

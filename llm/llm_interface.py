@@ -184,7 +184,67 @@ Return only the class index (just the number) that best matches the user input:"
             pass
         
         return None
-    
+
+    def select_next_secondary_class_walk_partner(
+        self,
+        user_input: str,
+        from_kind: str,
+        current_class_index: int,
+        candidates_context: str,
+    ):
+        """
+        Pick the next secondary class index for WalkWithPartner when support is low.
+
+        Args:
+            user_input: User's primary intent text
+            from_kind: "primary" or "secondary" (where the walk is stepping from)
+            current_class_index: Current primary or secondary class index
+            candidates_context: Formatted list of candidate secondary classes (index, support, description)
+
+        Returns:
+            Selected secondary class index (int) or None
+        """
+        template = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You choose the next secondary (satellite) class index for a composite prompt chain. "
+                    "Reply with only the chosen class index as an integer.",
+                ),
+                (
+                    "user",
+                    """User input (overall goal): {user_input}
+
+We are stepping from {from_kind} class index {current_class_index}.
+Choose the next secondary class index from the candidates below (use only listed indices).
+
+Candidates (secondary class index, observed support count, short description):
+{candidates}
+
+Return only the integer class index you choose:""",
+                ),
+            ]
+        )
+        chain = template | self.llm
+        response = chain.invoke(
+            {
+                "user_input": user_input,
+                "from_kind": from_kind,
+                "current_class_index": current_class_index,
+                "candidates": candidates_context,
+            }
+        )
+        response_text = response.content.strip()
+        try:
+            import re
+
+            numbers = re.findall(r"\d+", response_text)
+            if numbers:
+                return int(numbers[0])
+        except Exception:
+            pass
+        return None
+
     def select_next_prompt_rag(self, current_prompt: str, candidate_prompts: list, completed_prompts: list = None):
         """
         Selects the next prompt to add to current prompt using RAG.

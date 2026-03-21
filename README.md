@@ -102,8 +102,9 @@ This repository implements the PromptXplorer framework, which constructs ordered
 ### Phase 3: Algorithms (`algorithms/` folder)
 
 **3.1. Sequence Construction (`algorithms/sequence_construction.py`)**
-- Two alternatives; choose via `--sequence_algorithm` in the runner.
+- Three alternatives; choose via `--sequence_algorithm` in the runner.
 - **`RandomWalk`**: LLM selects primary class; then support-weighted sampling over consecutive secondary classes to generate `large_k` class sequences.
+- **`WalkWithPartner`**: Same as RandomWalk for primary choice and for transitions, but if the current node’s **total outgoing support** is in the bottom `llm_usage_percent` of all nodes of that type (primary vs secondary), the next secondary class is chosen by LLM instead of sampling. Control with `--walk_partner_llm_percent` (0 = never LLM on transitions, 100 = always; default 25). Run: `--sequence_algorithm walk_with_partner`.
 - **`IPF` (Iterative Proportional Fitting)**: Fits a distribution over all length-φ permutations of secondary classes to match observed constraint marginals from the data (degree-2 = consecutive pairs; degree-3 = consecutive triples when `--ipf_degree 3`). After convergence, returns top-`large_k` sequences by probability. Same-class pairs are excluded (outcomes are permutations). Run with IPF: `--sequence_algorithm ipf`; optional: `--ipf_degree 2` (or 3).
 
 **3.2. Representative Selection (`algorithms/representative_selection.py`)**
@@ -125,6 +126,8 @@ This repository implements the PromptXplorer framework, which constructs ordered
   - **Second LLM Integration**: LLM selects best instances based on current prompt context
   - Generate final composite prompt sequences (primary + ordered complementary instances)
   - **Note**: Applied after k-set coverage to reduce LLM costs by only selecting instances for k sequences
+- `SampledGreedySelector`: sample a subset per class, pick nearest neighbor to the current prompt (cosine); no LLM.
+- `BruteForceSelector`: uses **all** prompts in the class. Splits into batches (`max_batch_size`), picks one winner per batch (LLM or mock), then runs further rounds on winners until one remains. **Mock mode** (`mock_llm=True`, default): no LLM; each batch winner is chosen uniformly at random from the top `mock_top_fraction` (default 0.25) by cosine similarity to the current prompt. Runner: `--prompt_selector brute_force`, plus `--brute_force_batch_size`, `--brute_force_mock_llm`, `--brute_force_top_fraction`. Optional `embed_fn` in code for tests/offline embeddings.
 
 **Preprocessing Components:**
 - `preprocessing/embedding.py`: `Embedding` class that computes and stores embeddings for all secondary prompts in `embeddings_db/secondary_embeddings.csv`
@@ -176,7 +179,7 @@ PromptXplorer-/
 ├── embeddings_db/             # Stored embeddings (CSV file)
 ├── prompt_manager_objects/     # Saved/loaded PromptManager objects (subfolders with CSV files)
 ├── algorithms/
-│   ├── sequence_construction.py  # Phase 3.1: Interface + IPF and RandomWalk classes
+│   ├── sequence_construction.py  # Phase 3.1: RandomWalk, WalkWithPartner, IPF
 │   ├── prompt_selector.py        # Phase 3.2: IndividualPromptSelector class (RAG + LLM)
 │   ├── representative_selection.py # Phase 3.3: KSetCoverage class
 │   └── sequence_ordering.py      # Phase 3.4: OrderSequence class
@@ -204,6 +207,7 @@ PromptXplorer-/
 2. **Create sequences of clusters (classes)** (choose one):
    - **IPF**: Fit distribution to degree-2 (and optionally degree-3) pair/triple marginals; return top-k sequences by probability.
    - **Random Walk**: Assign class to primary (LLM) → support-weighted random walk → get sequences.
+   - **WalkWithPartner**: Like random walk, but LLM picks the next secondary when the current node is in the lowest-X% by outgoing support (`--walk_partner_llm_percent`).
      - Gelman-Rubin for convergence
      - **First LLM use**: If confidence below threshold
 3. **Convert cluster sequences → individual prompt sequences** (each sequence independently)

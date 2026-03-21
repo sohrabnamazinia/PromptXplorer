@@ -10,9 +10,13 @@ from datetime import datetime
 from data_model.load_data import DataLoader
 from preprocessing.clusterer import Clustering
 from preprocessing.embedding import Embedding
-from algorithms.sequence_construction import RandomWalk, IPF
+from algorithms.sequence_construction import RandomWalk, WalkWithPartner, IPF
 from algorithms.k_set_coverage import KSetCoverage
-from algorithms.prompt_selector import IndividualPromptSelector
+from algorithms.prompt_selector import (
+    IndividualPromptSelector,
+    SampledGreedySelector,
+    BruteForceSelector,
+)
 from algorithms.sequence_ordering import OrderSequence
 from llm.rag import RAG
 from llm.llm_interface import LLMInterface
@@ -40,6 +44,8 @@ def main():
     #   python run_prompt_x_plorer.py --n 50 --n_clusters_primary 3 --n_clusters_secondary 5 --phi 2 --large_k 10 --small_k 3 --top_l 3
     # Small-scale run with IPF:
     #   python run_prompt_x_plorer.py --n 50 --n_clusters_primary 3 --n_clusters_secondary 5 --phi 2 --large_k 10 --small_k 3 --top_l 3 --sequence_algorithm ipf
+    # WalkWithPartner (LLM on bottom 25%% of nodes by outgoing support; override with --walk_partner_llm_percent):
+    #   python run_prompt_x_plorer.py --n 50 --phi 2 --large_k 10 --sequence_algorithm walk_with_partner
     parser = argparse.ArgumentParser(description="Run PromptXplorer end-to-end")
     
     # Dataset parameters
@@ -61,8 +67,10 @@ def main():
     
     # Sequence construction parameters
     parser.add_argument("--sequence_algorithm", type=str, default="random_walk",
-                        choices=["random_walk", "ipf"],
-                        help="Sequence construction algorithm: random_walk or ipf. Default: random_walk")
+                        choices=["random_walk", "walk_with_partner", "ipf"],
+                        help="Sequence construction: random_walk, walk_with_partner (support + LLM on low-support nodes), or ipf. Default: random_walk")
+    parser.add_argument("--walk_partner_llm_percent", type=float, default=25.0,
+                        help="WalkWithPartner only: bottom this %% of nodes (by outgoing support) use LLM for the next step; 0=never, 100=always. Default: 25")
     parser.add_argument("--ipf_degree", type=int, default=2,
                         help="IPF constraint degree (1=singletons, 2=pairs, 3=triples, ...). Used only if sequence_algorithm=ipf. Default: 2")
     parser.add_argument("--ipf_max_iter", type=int, default=400,
@@ -81,6 +89,31 @@ def main():
     # RAG parameters
     parser.add_argument("--top_l", type=int, default=5,
                         help="Number of top candidates for RAG retrieval")
+    parser.add_argument(
+        "--prompt_selector",
+        type=str,
+        default="individual",
+        choices=["individual", "sampled_greedy", "brute_force"],
+        help="Phase 3.3: individual (RAG+LLM), sampled_greedy (sample+nearest neighbor), or brute_force (all-class tournament). Default: individual",
+    )
+    parser.add_argument(
+        "--brute_force_batch_size",
+        type=int,
+        default=15,
+        help="Brute force: max candidates per LLM/context batch. Default: 15",
+    )
+    parser.add_argument(
+        "--brute_force_mock_llm",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Brute force: if true (default), no LLM; random pick among top fraction by cosine. If false, LLM per batch. Default: True",
+    )
+    parser.add_argument(
+        "--brute_force_top_fraction",
+        type=float,
+        default=0.25,
+        help="Brute force mock mode: top this fraction by relevance (cosine) for random choice. Default: 0.25",
+    )
     
     # Output parameters
     parser.add_argument("--save_prompt_manager", type=lambda x: x.lower() == 'true', default=True,
@@ -130,6 +163,8 @@ def main():
         tee.write(f"Large K (sequences): {args.large_k}\n")
         tee.write(f"Small K (selected sequences): {args.small_k}\n")
         tee.write(f"Top L (RAG candidates): {args.top_l}\n")
+        tee.write(f"Prompt selector: {args.prompt_selector}\n")
+        tee.write(f"Brute force batch size / mock_llm / top_fraction: {args.brute_force_batch_size} / {args.brute_force_mock_llm} / {args.brute_force_top_fraction}\n")
         tee.write(f"Save PromptManager: {args.save_prompt_manager}\n")
         tee.write(f"Output prefix: {args.output_prefix}\n")
         tee.write("=" * 80 + "\n\n")
@@ -177,13 +212,21 @@ def main():
         
         # Phase 3.1: Sequence construction (Random Walk or IPF)
         phase_start = time.time()
-        phase_name = "IPF" if args.sequence_algorithm == "ipf" else "Random Walk"
+        if args.sequence_algorithm == "ipf":
+            phase_name = "IPF"
+        elif args.sequence_algorithm == "walk_with_partner":
+            phase_name = "WalkWithPartner"
+        else:
+            phase_name = "Random Walk"
         print("\n" + "=" * 80)
         print(f"Phase 3.1: Sequence construction ({phase_name})...")
         print("=" * 80)
         if args.sequence_algorithm == "ipf":
             ipf = IPF(pm, degree=args.ipf_degree, max_iter=args.ipf_max_iter, use_degree1=args.ipf_use_degree1)
             composite_class_sequences = ipf.run(args.user_input, args.phi, args.large_k)
+        elif args.sequence_algorithm == "walk_with_partner":
+            wwp = WalkWithPartner(pm, llm_usage_percent=args.walk_partner_llm_percent)
+            composite_class_sequences = wwp.random_walk_iter(args.user_input, args.phi, args.large_k)
         else:
             random_walk = RandomWalk(pm)
             composite_class_sequences = random_walk.random_walk_iter(args.user_input, args.phi, args.large_k)
@@ -207,11 +250,27 @@ def main():
         # Phase 3.3: Prompt Selector
         phase_start = time.time()
         print("\n" + "=" * 80)
-        print("Phase 3.3: Prompt Selector...")
+        sel_label = {
+            "individual": "IndividualPromptSelector",
+            "sampled_greedy": "SampledGreedySelector",
+            "brute_force": "BruteForceSelector",
+        }[args.prompt_selector]
+        print(f"Phase 3.3: Prompt Selector ({sel_label})...")
         print("=" * 80)
         llm_interface = LLMInterface()
         rag = RAG(embedding, llm_interface, top_l=args.top_l)
-        prompt_selector = IndividualPromptSelector(pm, rag)
+        if args.prompt_selector == "individual":
+            prompt_selector = IndividualPromptSelector(pm, rag)
+        elif args.prompt_selector == "sampled_greedy":
+            prompt_selector = SampledGreedySelector(pm, rag)
+        else:
+            prompt_selector = BruteForceSelector(
+                pm,
+                rag,
+                max_batch_size=args.brute_force_batch_size,
+                mock_llm=args.brute_force_mock_llm,
+                mock_top_fraction=args.brute_force_top_fraction,
+            )
         prompt_selector.select_prompts(args.user_input, args.phi)
         execution_times['Phase 3.3: Prompt Selector'] = time.time() - phase_start
         

@@ -1,0 +1,5 @@
+candidates_per_class,relevance_sampled_greedy,relevance_prompt_selector,phi,small_k,large_k
+3,0.7438,0.7565,2,5,30
+5,0.7268,0.75,2,5,30
+10,0.7308,0.7186,2,5,30
+20,0.7615,0.7169,2,5,30
