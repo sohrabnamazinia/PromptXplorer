@@ -38,10 +38,18 @@ class SecondaryPrompt:
 
 class CompositePrompt:
     """Represents a composite prompt (primary + ordered secondaries)."""
-    
-    def __init__(self, primary: PrimaryPrompt, secondaries: list):
+
+    def __init__(
+        self,
+        primary: PrimaryPrompt,
+        secondaries: list,
+        label: str = None,
+        statement_id: str = None,
+    ):
         self.primary = primary
         self.secondaries = secondaries  # ordered list of SecondaryPrompt objects
+        self.label = label  # e.g. LIAR veracity label
+        self.statement_id = statement_id  # e.g. Politifact statement id
     
     def get_composite_class(self):
         """Returns ordered list of classes: [primary.class, secondary1.class, ...]"""
