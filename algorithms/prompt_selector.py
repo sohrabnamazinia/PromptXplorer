@@ -4,7 +4,7 @@ Prompt Selector algorithm for selecting actual prompt instances.
 
 import sys
 import os
-from typing import Optional, List, Any
+from typing import Any, Callable, List, Optional
 
 import numpy as np
 from openai import OpenAI
@@ -77,32 +77,43 @@ class IndividualPromptSelector:
         
         return result
     
-    def select_prompts(self, user_input: str, phi: int):
+    def select_prompts(
+        self,
+        user_input: str,
+        phi: int,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ):
         """
         Select actual prompt instances for k sequences.
-        
+
         Args:
             user_input: Initial user input prompt
             phi: Number of secondary prompts to add
-        
+            progress_callback: If set, called with a short status string after each
+                secondary pick (useful for long LLM runs).
+
         Returns:
             List of k complete composite prompts (strings)
         """
         if not self.prompt_manager.k_class_sequences:
             return []
-        
+
         k_prompts = []
         self.completed_prompts = []  # Reset for each call
-        
-        for seq_idx, class_sequence in enumerate(self.prompt_manager.k_class_sequences):
+        sequences = self.prompt_manager.k_class_sequences
+        n_seq = len(sequences)
+
+        for seq_idx, class_sequence in enumerate(sequences):
             # class_sequence is [primary_class, secondary_class_1, ..., secondary_class_phi]
             secondary_classes = class_sequence[1:phi+1] if len(class_sequence) > 1 else []
-            
+
             # Start with user input
             current_prompt = user_input
-            
+            sc_list = secondary_classes[:phi]
+            n_steps = len(sc_list)
+
             # Iteratively add secondary prompts phi times
-            for secondary_class in secondary_classes[:phi]:
+            for step_idx, secondary_class in enumerate(sc_list):
                 result = self._select_secondary_prompt_with_context(current_prompt, secondary_class)
                 if result and 'updated_prompt' in result:
                     current_prompt = result['updated_prompt']
@@ -112,7 +123,15 @@ class IndividualPromptSelector:
                                 if item['class_label'] == secondary_class]
                     if candidates:
                         current_prompt = f"{current_prompt}, {candidates[0]}"
-            
+                if progress_callback:
+                    sub_done = seq_idx * phi + step_idx + 1
+                    sub_total = max(1, n_seq * phi)
+                    pct = 100.0 * min(sub_done, sub_total) / sub_total
+                    progress_callback(
+                        f"seq {seq_idx + 1}/{n_seq}, pick {step_idx + 1}/{max(n_steps, 1)} "
+                        f"— {pct:.0f}% of this selector run"
+                    )
+
             k_prompts.append(current_prompt)
             self.completed_prompts.append(current_prompt)
         
@@ -203,14 +222,21 @@ class SampledGreedySelector:
         updated_prompt = f"{current_prompt}, {selected_text}"
         return {"selected_prompt": selected_text, "updated_prompt": updated_prompt}
 
-    def select_prompts(self, user_input: str, phi: int):
+    def select_prompts(
+        self,
+        user_input: str,
+        phi: int,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ):
         if not self.prompt_manager.k_class_sequences:
             return []
 
         k_prompts = []
         self.completed_prompts = []
+        sequences = self.prompt_manager.k_class_sequences
+        n_seq = len(sequences)
 
-        for class_sequence in self.prompt_manager.k_class_sequences:
+        for _, class_sequence in enumerate(sequences):
             secondary_classes = class_sequence[1 : phi + 1] if len(class_sequence) > 1 else []
             current_prompt = user_input
 
@@ -233,20 +259,26 @@ class SampledGreedySelector:
 
             k_prompts.append(current_prompt)
             self.completed_prompts.append(current_prompt)
+            if progress_callback:
+                pct = 100.0 * len(k_prompts) / max(1, n_seq)
+                progress_callback(
+                    f"finished sequence {len(k_prompts)}/{n_seq} ({pct:.0f}% of this selector run)"
+                )
 
         self.prompt_manager.final_composite_prompts = k_prompts
         return k_prompts
 
 
-class BruteForceSelector:
+class NaiveSelector:
     """
-    Considers every prompt in the target class, in batches (for context limits). Each batch
-    yields one winner via LLM or via mock mode. Winners are merged in further rounds until
-    one prompt remains (same batching + final merge).
+    Naive batched tournament over all prompts in the class (not a global argmax).
 
-    ``mock_llm=True`` (default): no LLM calls; each batch winner is drawn uniformly at random
-    from the top ``mock_top_fraction`` of that batch by cosine similarity to the current prompt.
-    ``mock_llm=False``: uses ``select_next_prompt_rag`` per batch and for the final merge.
+    Splits the class pool into batches (context limit). Each batch yields one winner; winners
+    are merged in further rounds until one prompt remains.
+
+    ``mock_llm=True`` (default): no LLM; each batch winner is drawn uniformly at random from the
+    top ``mock_top_fraction`` of that batch by cosine similarity to the current prompt.
+    ``mock_llm=False``: uses ``select_next_prompt_rag`` per batch and for the merge rounds.
 
     Pass ``embed_fn`` for tests or offline use; default uses OpenAI embeddings like other selectors.
     """
@@ -257,7 +289,7 @@ class BruteForceSelector:
         rag: RAG,
         max_batch_size: int = 15,
         mock_llm: bool = True,
-        mock_top_fraction: float = 0.25,
+        mock_top_fraction: float = 0.15,
         seed: int = 42,
         embed_fn=None,
     ):
@@ -382,14 +414,21 @@ class BruteForceSelector:
         updated_prompt = f"{current_prompt}, {selected_text}"
         return {"selected_prompt": selected_text, "updated_prompt": updated_prompt}
 
-    def select_prompts(self, user_input: str, phi: int):
+    def select_prompts(
+        self,
+        user_input: str,
+        phi: int,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ):
         if not self.prompt_manager.k_class_sequences:
             return []
 
         k_prompts = []
         self.completed_prompts = []
+        sequences = self.prompt_manager.k_class_sequences
+        n_seq = len(sequences)
 
-        for class_sequence in self.prompt_manager.k_class_sequences:
+        for _, class_sequence in enumerate(sequences):
             secondary_classes = class_sequence[1 : phi + 1] if len(class_sequence) > 1 else []
             current_prompt = user_input
 
@@ -411,6 +450,11 @@ class BruteForceSelector:
 
             k_prompts.append(current_prompt)
             self.completed_prompts.append(current_prompt)
+            if progress_callback:
+                pct = 100.0 * len(k_prompts) / max(1, n_seq)
+                progress_callback(
+                    f"finished sequence {len(k_prompts)}/{n_seq} ({pct:.0f}% of this selector run)"
+                )
 
         self.prompt_manager.final_composite_prompts = k_prompts
         return k_prompts

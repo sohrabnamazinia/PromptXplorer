@@ -5,3 +5,4 @@ prompt_xplorer_outputs
 prompt_xplorer_objects
 embeddings_db/*
 prompt_manager_objects/*
+experiments/outputs/

@@ -5,7 +5,7 @@ from .k_set_coverage import KSetCoverage
 from .prompt_selector import (
     IndividualPromptSelector,
     SampledGreedySelector,
-    BruteForceSelector,
+    NaiveSelector,
 )
 from .sequence_ordering import OrderSequence
 
@@ -14,6 +14,6 @@ __all__ = [
     "KSetCoverage",
     "IndividualPromptSelector",
     "SampledGreedySelector",
-    "BruteForceSelector",
+    "NaiveSelector",
     "OrderSequence",
 ]

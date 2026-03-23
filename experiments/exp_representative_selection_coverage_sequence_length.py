@@ -7,10 +7,39 @@ in the data) covered by the k selected sequences.
 Run from repo root:
   python experiments/exp_representative_selection_coverage_sequence_length.py
 
+Datasets (CSV under data/): diffusion_db, liar, race
+  --dataset all          run all three (default)
+  --dataset diffusion_db only DiffusionDB
+  --dataset liar         only LIAR
+  --dataset race         only RACE
+
+Outputs (one CSV + one PNG per dataset run):
+  experiments/outputs/csv/rep_select_coverage_phi_<dataset>_<timestamp>.csv
+  experiments/outputs/figs/rep_select_coverage_phi_<dataset>_<timestamp>.png
+
 Optional:
-  python experiments/exp_representative_selection_coverage_sequence_length.py --dataset 1 --seed 42
-  (φ is always 1, 3, 5, 7, 9 — use --phi_values to override)
+  --n 200 --seed 42 --phi_values 1,3,5,7,9
 """
+
+# -----------------------------------------------------------------------------
+# Key parameters (defaults match argparse below; override via CLI)
+# -----------------------------------------------------------------------------
+# --dataset              all              # diffusion_db | liar | race | all
+# --n                    200              # rows loaded per CSV (not "all")
+# --separated            True
+# --phi_values           1,3,5,7,9        # sequence lengths φ evaluated
+# --large_k              50               # candidate class sequences per φ
+# --small_k              5                # sequences selected (greedy / stochastic)
+# --stochastic_sample_size 5              # pool size sampled each stochastic step
+# --seed                 42
+# --n_clusters_primary   5
+# --n_clusters_secondary 10
+#
+# Fixed in code (no CLI):
+#   Clustering algorithm    kmeans
+#   Sequence sampling       support-weighted random walk (0.1 pseudo-mass)
+#   Coverage denominator    all distinct class ids appearing in clustered data
+# -----------------------------------------------------------------------------
 
 import argparse
 import os
@@ -28,10 +57,23 @@ from data_model.load_data import DataLoader
 from preprocessing.clusterer import Clustering
 from algorithms.k_set_coverage import KSetCoverage
 
-# Dataset index -> CSV path (extend when adding datasets 2 and 3)
-DATASETS = {
-    1: os.path.join(ROOT, "data", "diffusion_db.csv"),
+DATASET_FILES = {
+    "diffusion_db": "diffusion_db.csv",
+    "liar": "liar.csv",
+    "race": "race.csv",
 }
+
+DATASET_DISPLAY = {
+    "diffusion_db": "DiffusionDB",
+    "liar": "LIAR",
+    "race": "RACE",
+}
+
+ALL_DATASET_KEYS = tuple(DATASET_FILES.keys())
+
+
+def _dataset_csv_path(key: str) -> str:
+    return os.path.join(ROOT, "data", DATASET_FILES[key])
 
 
 def _secondary_classes(pm):
@@ -80,6 +122,7 @@ def _sample_sequence_support(pm, primary_class, phi, rng):
 
 def _most_frequent_primary_class(pm):
     from collections import Counter
+
     c = Counter()
     for cp in pm.composite_prompts:
         if cp.primary.class_obj:
@@ -89,48 +132,33 @@ def _most_frequent_primary_class(pm):
     return c.most_common(1)[0][0]
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=int, default=1, help="Dataset index (default 1)")
-    parser.add_argument("--n", type=int, default=200, help="Rows from CSV (None = all)")
-    parser.add_argument("--separated", type=lambda x: str(x).lower() == "true", default=True)
-    parser.add_argument(
-        "--phi_values",
-        type=str,
-        default="1,3,5,7,9",
-        help="Comma-separated φ values to evaluate (default: 1,3,5,7,9)",
+def _parse_dataset_arg(raw: str) -> list[str]:
+    s = (raw or "").strip().lower()
+    if s in ("", "all"):
+        return list(ALL_DATASET_KEYS)
+    if s in DATASET_FILES:
+        return [s]
+    raise SystemExit(
+        f"Unknown --dataset {raw!r}. Use: all, {', '.join(ALL_DATASET_KEYS)}"
     )
-    parser.add_argument("--large_k", type=int, default=50)
-    parser.add_argument("--small_k", type=int, default=5)
-    parser.add_argument(
-        "--stochastic_sample_size",
-        type=int,
-        default=5,
-        help="Candidates sampled per greedy step (smaller → stochastic worse vs full greedy)",
-    )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--n_clusters_primary", type=int, default=5)
-    parser.add_argument("--n_clusters_secondary", type=int, default=10)
-    args = parser.parse_args()
 
-    if args.dataset not in DATASETS:
-        raise SystemExit(f"Unknown dataset index {args.dataset}. Known: {list(DATASETS)}")
-    csv_path = DATASETS[args.dataset]
+
+def run_one_dataset(dataset_key: str, args, rng: np.random.Generator, ts: str):
+    csv_path = _dataset_csv_path(dataset_key)
     if not os.path.isfile(csv_path):
         raise SystemExit(f"Dataset file not found: {csv_path}")
 
-    rng = np.random.default_rng(args.seed)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_csv_dir = os.path.join(ROOT, "experiments", "outputs", "csv")
     out_fig_dir = os.path.join(ROOT, "experiments", "outputs", "figs")
     os.makedirs(out_csv_dir, exist_ok=True)
     os.makedirs(out_fig_dir, exist_ok=True)
 
-    base = f"rep_select_coverage_phi_dataset{args.dataset}_{ts}"
+    base = f"rep_select_coverage_phi_{dataset_key}_{ts}"
     csv_path_out = os.path.join(out_csv_dir, f"{base}.csv")
     fig_path_out = os.path.join(out_fig_dir, f"{base}.png")
+    display_name = DATASET_DISPLAY[dataset_key]
 
-    print("Loading and clustering...")
+    print(f"\n=== Dataset: {display_name} ({csv_path}) ===")
     loader = DataLoader(separated=args.separated, n=args.n)
     pm = loader.load_data(csv_path)
     clusterer = Clustering(pm, algorithm="kmeans")
@@ -184,15 +212,13 @@ def main():
         for seq in sequences:
             pool_universe.update(seq)
         n_pool = len(pool_universe)
-        pct_g = (
-            (100.0 * cov_greedy / n_dataset_classes) if n_dataset_classes else 0.0
-        )
-        pct_s = (
-            (100.0 * cov_stoch / n_dataset_classes) if n_dataset_classes else 0.0
-        )
+        pct_g = (100.0 * cov_greedy / n_dataset_classes) if n_dataset_classes else 0.0
+        pct_s = (100.0 * cov_stoch / n_dataset_classes) if n_dataset_classes else 0.0
 
         rows.append(
             {
+                "dataset": dataset_key,
+                "dataset_display": display_name,
                 "phi": phi,
                 "dataset_distinct_classes": n_dataset_classes,
                 "pool_distinct_classes": n_pool,
@@ -217,21 +243,23 @@ def main():
             df["phi"],
             df["coverage_greedy_pct_of_dataset"],
             marker="s",
-            label="Greedy k-set coverage",
+            label="GreedyCoverage",
         )
         plt.plot(
             df["phi"],
             df["coverage_stochastic_pct_of_dataset"],
             marker="o",
-            label=f"Stochastic (sample={args.stochastic_sample_size}/step)",
+            label=f"StochasticCoverage (sample={args.stochastic_sample_size}/step)",
         )
-        plt.xlabel("Sequence length φ (secondary classes per sequence)")
-        plt.ylabel("Coverage (%)")
+        plt.xlabel("Sequence length φ")
+        plt.ylabel("Coverage score (%)")
         plt.ylim(0, 105)
         xticks = sorted({int(x) for x in df["phi"].tolist()})
         plt.xticks(xticks)
         plt.xlim(min(xticks) - 1.0, max(xticks) + 1.0)
-        plt.title("Representative selection: coverage vs φ")
+        plt.title(
+            f"Representative selection: coverage vs φ — {display_name}"
+        )
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.tight_layout()
@@ -240,6 +268,48 @@ def main():
         print(f"Wrote {fig_path_out}")
     except ImportError:
         print("matplotlib not installed; skipped figure. pip install matplotlib")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Coverage vs φ for greedy vs stochastic k-set coverage."
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="all",
+        help="diffusion_db, liar, race, or all (default: all)",
+    )
+    parser.add_argument("--n", type=int, default=200, help="Rows from CSV (None = all)")
+    parser.add_argument(
+        "--separated", type=lambda x: str(x).lower() == "true", default=True
+    )
+    parser.add_argument(
+        "--phi_values",
+        type=str,
+        default="1,3,5,7,9",
+        help="Comma-separated φ values (default: 1,3,5,7,9)",
+    )
+    parser.add_argument("--large_k", type=int, default=50)
+    parser.add_argument("--small_k", type=int, default=5)
+    parser.add_argument(
+        "--stochastic_sample_size",
+        type=int,
+        default=5,
+        help="Candidates sampled per greedy step",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n_clusters_primary", type=int, default=5)
+    parser.add_argument("--n_clusters_secondary", type=int, default=10)
+    args = parser.parse_args()
+
+    datasets = _parse_dataset_arg(args.dataset)
+    rng = np.random.default_rng(args.seed)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print("Loading and clustering per dataset...")
+    for key in datasets:
+        run_one_dataset(key, args, rng, ts)
 
 
 if __name__ == "__main__":

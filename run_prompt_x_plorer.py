@@ -15,7 +15,7 @@ from algorithms.k_set_coverage import KSetCoverage
 from algorithms.prompt_selector import (
     IndividualPromptSelector,
     SampledGreedySelector,
-    BruteForceSelector,
+    NaiveSelector,
 )
 from algorithms.sequence_ordering import OrderSequence
 from llm.rag import RAG
@@ -93,26 +93,26 @@ def main():
         "--prompt_selector",
         type=str,
         default="individual",
-        choices=["individual", "sampled_greedy", "brute_force"],
-        help="Phase 3.3: individual (RAG+LLM), sampled_greedy (sample+nearest neighbor), or brute_force (all-class tournament). Default: individual",
+        choices=["individual", "sampled_greedy", "naive"],
+        help="Phase 3.3: individual (RAG+LLM), sampled_greedy (sample+nearest), or naive (batched tournament). Default: individual",
     )
     parser.add_argument(
-        "--brute_force_batch_size",
+        "--naive_batch_size",
         type=int,
         default=15,
-        help="Brute force: max candidates per LLM/context batch. Default: 15",
+        help="NaiveSelector: max candidates per LLM/context batch. Default: 15",
     )
     parser.add_argument(
-        "--brute_force_mock_llm",
+        "--naive_mock_llm",
         type=lambda x: x.lower() == "true",
         default=True,
-        help="Brute force: if true (default), no LLM; random pick among top fraction by cosine. If false, LLM per batch. Default: True",
+        help="NaiveSelector: if true (default), no LLM; random pick among top fraction by cosine. If false, LLM per batch. Default: True",
     )
     parser.add_argument(
-        "--brute_force_top_fraction",
+        "--naive_top_fraction",
         type=float,
-        default=0.25,
-        help="Brute force mock mode: top this fraction by relevance (cosine) for random choice. Default: 0.25",
+        default=0.15,
+        help="NaiveSelector mock mode: top this fraction by cosine for random choice. Default: 0.15",
     )
     
     # Output parameters
@@ -164,7 +164,7 @@ def main():
         tee.write(f"Small K (selected sequences): {args.small_k}\n")
         tee.write(f"Top L (RAG candidates): {args.top_l}\n")
         tee.write(f"Prompt selector: {args.prompt_selector}\n")
-        tee.write(f"Brute force batch size / mock_llm / top_fraction: {args.brute_force_batch_size} / {args.brute_force_mock_llm} / {args.brute_force_top_fraction}\n")
+        tee.write(f"NaiveSelector batch size / mock_llm / top_fraction: {args.naive_batch_size} / {args.naive_mock_llm} / {args.naive_top_fraction}\n")
         tee.write(f"Save PromptManager: {args.save_prompt_manager}\n")
         tee.write(f"Output prefix: {args.output_prefix}\n")
         tee.write("=" * 80 + "\n\n")
@@ -253,7 +253,7 @@ def main():
         sel_label = {
             "individual": "IndividualPromptSelector",
             "sampled_greedy": "SampledGreedySelector",
-            "brute_force": "BruteForceSelector",
+            "naive": "NaiveSelector",
         }[args.prompt_selector]
         print(f"Phase 3.3: Prompt Selector ({sel_label})...")
         print("=" * 80)
@@ -263,14 +263,16 @@ def main():
             prompt_selector = IndividualPromptSelector(pm, rag)
         elif args.prompt_selector == "sampled_greedy":
             prompt_selector = SampledGreedySelector(pm, rag)
-        else:
-            prompt_selector = BruteForceSelector(
+        elif args.prompt_selector == "naive":
+            prompt_selector = NaiveSelector(
                 pm,
                 rag,
-                max_batch_size=args.brute_force_batch_size,
-                mock_llm=args.brute_force_mock_llm,
-                mock_top_fraction=args.brute_force_top_fraction,
+                max_batch_size=args.naive_batch_size,
+                mock_llm=args.naive_mock_llm,
+                mock_top_fraction=args.naive_top_fraction,
             )
+        else:
+            raise ValueError(f"Unknown prompt_selector: {args.prompt_selector}")
         prompt_selector.select_prompts(args.user_input, args.phi)
         execution_times['Phase 3.3: Prompt Selector'] = time.time() - phase_start
         

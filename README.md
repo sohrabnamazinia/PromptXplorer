@@ -127,7 +127,7 @@ This repository implements the PromptXplorer framework, which constructs ordered
   - Generate final composite prompt sequences (primary + ordered complementary instances)
   - **Note**: Applied after k-set coverage to reduce LLM costs by only selecting instances for k sequences
 - `SampledGreedySelector`: sample a subset per class, pick nearest neighbor to the current prompt (cosine); no LLM.
-- `BruteForceSelector`: uses **all** prompts in the class. Splits into batches (`max_batch_size`), picks one winner per batch (LLM or mock), then runs further rounds on winners until one remains. **Mock mode** (`mock_llm=True`, default): no LLM; each batch winner is chosen uniformly at random from the top `mock_top_fraction` (default 0.25) by cosine similarity to the current prompt. Runner: `--prompt_selector brute_force`, plus `--brute_force_batch_size`, `--brute_force_mock_llm`, `--brute_force_top_fraction`. Optional `embed_fn` in code for tests/offline embeddings.
+- `NaiveSelector` (naive batched tournament): uses **all** prompts in the class pool. Splits into batches (`max_batch_size`), picks one winner per batch (LLM or mock), then runs further rounds on winners until one remains. **Mock mode** (`mock_llm=True`, default): no LLM; each batch winner is chosen uniformly at random from the top `mock_top_fraction` (default 0.15) by cosine similarity to the current prompt. Runner: `--prompt_selector naive`, plus `--naive_batch_size`, `--naive_mock_llm`, `--naive_top_fraction`. Optional `embed_fn` in code for tests/offline embeddings.
 
 **Preprocessing Components:**
 - `preprocessing/embedding.py`: `Embedding` class that computes and stores embeddings for all secondary prompts in `embeddings_db/secondary_embeddings.csv`
