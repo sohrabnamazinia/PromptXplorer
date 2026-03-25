@@ -82,8 +82,25 @@ def _resolve_input_prompt(dataset_key: str, args) -> str:
     return DEFAULT_INPUT_PROMPTS[dataset_key]
 
 
-def _generate_from_prompt(llm: LLMInterface, prompt_text: str) -> str:
-    msg = llm.llm.invoke(prompt_text)
+def _direct_single_shot_composite_prompt(
+    llm: LLMInterface, input_prompt: str, phi: int
+) -> str:
+    """
+    Single-shot direct baseline: produce one enriched prompt string in the same
+    style as PromptXplorer output (base prompt + up to phi secondary clauses).
+    """
+    instruction = f"""
+Given the input prompt, write exactly one enriched prompt as a single line.
+
+Requirements:
+- Keep the original input prompt text at the beginning.
+- Append up to {phi} secondary details, comma-separated.
+- Do not use numbering, bullets, markdown, or explanations.
+- Output only the final prompt string.
+
+Input prompt: {input_prompt}
+""".strip()
+    msg = llm.llm.invoke(instruction)
     content = getattr(msg, "content", "")
     return str(content).strip()
 
@@ -187,11 +204,13 @@ def main():
         print(f"\n[{display}] building PromptXplorer output...")
         final_prompt = _run_promptxplorer_pipeline(d, args, user_input)
 
-        print(f"[{display}] generating PromptXplorer result...")
-        px_result = _generate_from_prompt(direct_llm, final_prompt)
+        print(f"[{display}] collecting PromptXplorer result...")
+        px_result = final_prompt
 
         print(f"[{display}] generating Direct LLM baseline...")
-        direct_result = _generate_from_prompt(direct_llm, user_input)
+        direct_result = _direct_single_shot_composite_prompt(
+            direct_llm, user_input, args.phi
+        )
 
         rows.append(
             {
