@@ -94,8 +94,13 @@ class Clustering:
         else:
             raise ValueError(f"Unknown algorithm: {self.algorithm}")
         
-        # Generate descriptions using LLM
-        descriptions = self._generate_class_descriptions(texts, labels)
+        # Generate descriptions (LLM by default; can be disabled for offline/benchmark runs)
+        use_llm_descriptions = True
+        if isinstance(params, dict) and "use_llm_descriptions" in params:
+            use_llm_descriptions = bool(params.get("use_llm_descriptions"))
+        descriptions = self._generate_class_descriptions(
+            texts, labels, use_llm_descriptions=use_llm_descriptions
+        )
         
         return labels, descriptions
     
@@ -132,14 +137,25 @@ class Clustering:
         
         return labels.tolist()
     
-    def _generate_class_descriptions(self, texts: list, labels: list):
-        """Generates class descriptions using LLM."""
+    def _generate_class_descriptions(
+        self, texts: list, labels: list, use_llm_descriptions: bool = True
+    ):
+        """Generates class descriptions (LLM by default; fallback is deterministic placeholders)."""
+        if not use_llm_descriptions:
+            return {int(lbl): f"cluster_{int(lbl)}" for lbl in set(labels) if int(lbl) >= 0}
+
         import sys
         import os
         sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from llm.llm_interface import LLMInterface
-        
-        llm_interface = LLMInterface()
+        try:
+            from llm.llm_interface import LLMInterface
+        except Exception:
+            return {int(lbl): f"cluster_{int(lbl)}" for lbl in set(labels) if int(lbl) >= 0}
+
+        try:
+            llm_interface = LLMInterface()
+        except Exception:
+            return {int(lbl): f"cluster_{int(lbl)}" for lbl in set(labels) if int(lbl) >= 0}
         descriptions = {}
         
         # Group texts by label
