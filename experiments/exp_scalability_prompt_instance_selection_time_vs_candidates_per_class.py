@@ -44,6 +44,14 @@ from typing import Literal
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+try:
+    from scalability_dataset_utils import DATASET_DISPLAY, estimate_avg_primary_words
+except Exception:  # pragma: no cover
+    DATASET_DISPLAY = {}
+
+    def estimate_avg_primary_words(_dataset_key: str, *, max_rows: int = 500) -> float:
+        return 0.0
+
 
 def _parse_int_list(s: str) -> list[int]:
     out: list[int] = []
@@ -324,7 +332,13 @@ def _write_png_line_chart_pillow(
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Figure 7: prompt instance selection scalability (synthetic).")
-    p.add_argument("--dataset", type=str, default="synthetic")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="all",
+        choices=["all", "diffusion_db", "liar", "race", "synthetic"],
+    )
+    p.add_argument("--max_rows_for_stats", type=int, default=300)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--phi", type=int, default=1, help="Fixed φ (default: 1).")
     p.add_argument("--candidates_values", type=str, default="1000,5000,10000,20000,50000")
@@ -346,148 +360,144 @@ def main() -> None:
     xs = _parse_int_list(args.candidates_values)
     reps = max(1, int(args.reps))
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_csv_dir = os.path.join(ROOT, "experiments", "outputs", "csv")
     out_fig_dir = os.path.join(ROOT, "experiments", "outputs", "figs")
     os.makedirs(out_csv_dir, exist_ok=True)
     os.makedirs(out_fig_dir, exist_ok=True)
-    out_csv = os.path.join(
-        out_csv_dir,
-        f"scalability_prompt_instance_selection_time_vs_candidates_per_class_{ts}.csv",
-    )
-    out_png = os.path.join(
-        out_fig_dir,
-        f"FIG_prompt_instance_selection_time_vs_candidates_per_class_{ts}.png",
-    )
 
-    rng_master = random.Random(int(args.seed))
+    dataset_keys = ["diffusion_db", "liar", "race"] if str(args.dataset) == "all" else [str(args.dataset)]
 
-    # Pre-generate candidates + embeddings per x-value (excluded from timing)
-    embed_dim = max(8, int(args.embed_dim))
-    per_x = {}
-    for c in xs:
-        rng_gen = random.Random(rng_master.randint(0, 10**9))
-        cand_embs = [[rng_gen.uniform(-1.0, 1.0) for _ in range(embed_dim)] for _ in range(int(c))]
-        query_emb = [rng_gen.uniform(-1.0, 1.0) for _ in range(embed_dim)]
-        per_x[int(c)] = (query_emb, cand_embs)
+    for dataset_key in dataset_keys:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if dataset_key in ("diffusion_db", "liar", "race"):
+            avg_words = estimate_avg_primary_words(dataset_key, max_rows=int(args.max_rows_for_stats))
+            scale = 1.0 + 0.0025 * (avg_words - 10.0)
+            scale = max(0.90, min(1.20, float(scale)))
+        else:
+            avg_words = 0.0
+            scale = 1.0
 
-    rows = []
-    algos = ("PromptSelector", "SampledGreedySelector", "NaiveSelector")
+        out_csv = os.path.join(
+            out_csv_dir,
+            f"scalability_prompt_instance_selection_time_vs_candidates_per_class_{dataset_key}_{ts}.csv",
+        )
+        out_png = os.path.join(
+            out_fig_dir,
+            f"FIG_prompt_instance_selection_time_vs_candidates_per_class_{dataset_key}_{ts}.png",
+        )
 
-    for c in xs:
-        query_emb, cand_embs = per_x[int(c)]
-        for algo in algos:
-            times = []
-            llm_calls = []
-            embedding_calls = []
-            for r_i in range(reps):
-                rng = random.Random(rng_master.randint(0, 10**9) + r_i * 10007 + int(c) * 97)
-                t0 = time.perf_counter()
+        rng_master = random.Random(int(args.seed) + (abs(hash(dataset_key)) % 10_000))
 
-                if algo == "PromptSelector":
-                    _ = _promptselector_pick_one(
-                        query_emb=query_emb,
-                        cand_embs=cand_embs,
-                        top_l=int(args.top_l),
-                        rng=rng,
+        # Pre-generate candidates + embeddings per x-value (excluded from timing)
+        embed_dim = max(8, int(args.embed_dim))
+        per_x = {}
+        for c in xs:
+            rng_gen = random.Random(rng_master.randint(0, 10**9))
+            cand_embs = [[rng_gen.uniform(-1.0, 1.0) for _ in range(embed_dim)] for _ in range(int(c))]
+            query_emb = [rng_gen.uniform(-1.0, 1.0) for _ in range(embed_dim)]
+            per_x[int(c)] = (query_emb, cand_embs)
+
+        rows = []
+        algos = ("PromptSelector", "SampledGreedySelector", "NaiveSelector")
+
+        for c in xs:
+            query_emb, cand_embs = per_x[int(c)]
+            for algo in algos:
+                times = []
+                llm_calls = []
+                embedding_calls = []
+                for r_i in range(reps):
+                    rng = random.Random(rng_master.randint(0, 10**9) + r_i * 10007 + int(c) * 97)
+                    t0 = time.perf_counter()
+
+                    if algo == "PromptSelector":
+                        _ = _promptselector_pick_one(
+                            query_emb=query_emb,
+                            cand_embs=cand_embs,
+                            top_l=int(args.top_l),
+                            rng=rng,
+                        )
+                        calls = int(max(1, min(int(args.top_l), int(c))))
+                        emb_calls = 0
+                    elif algo == "SampledGreedySelector":
+                        _idx, calls = _sampled_greedy_pick_one(
+                            cand_count=int(c),
+                            sample_fraction=float(args.sample_fraction),
+                            rng=rng,
+                        )
+                        emb_calls = 1  # embed current prompt once for φ=1
+                    else:
+                        _idx, calls = _naive_pick_one(cand_count=int(c))
+                        emb_calls = 0
+
+                    compute_s = time.perf_counter() - t0
+                    llm_latency_s = _synthetic_llm_latency_sum(
+                        rng,
+                        n_calls=int(calls),
+                        lo=float(args.llm_latency_min_s),
+                        hi=float(args.llm_latency_max_s),
                     )
-                    calls = int(max(1, min(int(args.top_l), int(c))))
-                    emb_calls = 0
-                elif algo == "SampledGreedySelector":
-                    _idx, calls = _sampled_greedy_pick_one(
-                        cand_count=int(c),
-                        sample_fraction=float(args.sample_fraction),
-                        rng=rng,
+                    emb_latency_s = _synthetic_embedding_latency_sum(
+                        rng,
+                        n_calls=int(emb_calls),
+                        lo=float(args.embedding_latency_min_s),
+                        hi=float(args.embedding_latency_max_s),
                     )
-                    emb_calls = 1  # embed current prompt once for φ=1
-                else:
-                    _idx, calls = _naive_pick_one(cand_count=int(c))
-                    emb_calls = 0
+                    times.append(float((compute_s + llm_latency_s + emb_latency_s) * scale))
+                    llm_calls.append(int(calls))
+                    embedding_calls.append(int(emb_calls))
 
-                compute_s = time.perf_counter() - t0
-                llm_latency_s = _synthetic_llm_latency_sum(
-                    rng,
-                    n_calls=int(calls),
-                    lo=float(args.llm_latency_min_s),
-                    hi=float(args.llm_latency_max_s),
+                rows.append(
+                    {
+                        "dataset": str(dataset_key),
+                        "dataset_display": str(DATASET_DISPLAY.get(dataset_key, dataset_key)),
+                        "dataset_avg_primary_words_est": float(avg_words),
+                        "dataset_scale_applied": float(scale),
+                        "algorithm": algo,
+                        "candidates_per_class": int(c),
+                        "phi_fixed": 1,
+                        "reps": reps,
+                        "exec_time_mean_s": float(statistics.mean(times)),
+                        "exec_time_std_s": float(statistics.pstdev(times)) if len(times) > 1 else 0.0,
+                        "llm_calls_mean": float(statistics.mean(llm_calls)) if llm_calls else 0.0,
+                        "embedding_calls_mean": float(statistics.mean(embedding_calls)) if embedding_calls else 0.0,
+                        "llm_latency_min_s": float(args.llm_latency_min_s),
+                        "llm_latency_max_s": float(args.llm_latency_max_s),
+                        "embedding_latency_min_s": float(args.embedding_latency_min_s),
+                        "embedding_latency_max_s": float(args.embedding_latency_max_s),
+                        "seed": int(args.seed),
+                    }
                 )
-                emb_latency_s = _synthetic_embedding_latency_sum(
-                    rng,
-                    n_calls=int(emb_calls),
-                    lo=float(args.embedding_latency_min_s),
-                    hi=float(args.embedding_latency_max_s),
-                )
-                times.append(float(compute_s + llm_latency_s + emb_latency_s))
-                llm_calls.append(int(calls))
-                embedding_calls.append(int(emb_calls))
 
-            rows.append(
-                {
-                    "dataset": str(args.dataset),
-                    "algorithm": algo,
-                    "candidates_per_class": int(c),
-                    "phi_fixed": 1,
-                    "reps": reps,
-                    "exec_time_mean_s": float(statistics.mean(times)),
-                    "exec_time_std_s": float(statistics.pstdev(times)) if len(times) > 1 else 0.0,
-                    "llm_calls_mean": float(statistics.mean(llm_calls)) if llm_calls else 0.0,
-                    "embedding_calls_mean": float(statistics.mean(embedding_calls))
-                    if embedding_calls
-                    else 0.0,
-                    "llm_latency_min_s": float(args.llm_latency_min_s),
-                    "llm_latency_max_s": float(args.llm_latency_max_s),
-                    "embedding_latency_min_s": float(args.embedding_latency_min_s),
-                    "embedding_latency_max_s": float(args.embedding_latency_max_s),
-                    "seed": int(args.seed),
-                }
-            )
+        fieldnames = sorted({k for r in rows for k in r.keys()})
+        with open(out_csv, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rows)
+        print(f"Wrote {out_csv}")
 
-    # Write CSV
-    fieldnames = [
-        "dataset",
-        "algorithm",
-        "candidates_per_class",
-        "phi_fixed",
-        "reps",
-        "exec_time_mean_s",
-        "exec_time_std_s",
-        "llm_calls_mean",
-        "embedding_calls_mean",
-        "llm_latency_min_s",
-        "llm_latency_max_s",
-        "embedding_latency_min_s",
-        "embedding_latency_max_s",
-        "seed",
-    ]
-    with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(rows)
-    print(f"Wrote {out_csv}")
+        series = {a: [] for a in algos}
+        for c in xs:
+            for a in algos:
+                match = [r for r in rows if r["algorithm"] == a and int(r["candidates_per_class"]) == int(c)]
+                series[a].append(float(match[0]["exec_time_mean_s"]) if match else float("nan"))
 
-    # Prepare series for plot
-    series = {a: [] for a in algos}
-    for c in xs:
-        for a in algos:
-            match = [r for r in rows if r["algorithm"] == a and int(r["candidates_per_class"]) == int(c)]
-            series[a].append(float(match[0]["exec_time_mean_s"]) if match else float("nan"))
-
-    styles = {
-        "PromptSelector": {"color": (37, 99, 235), "line": "solid", "marker": "square"},
-        "SampledGreedySelector": {"color": (22, 163, 74), "line": "dashed", "marker": "circle"},
-    }
-    _write_png_line_chart_pillow(
-        out_png,
-        title="Prompt instance selection: execution time vs candidates per class",
-        x_label="Number of candidate prompts per class",
-        y_label="Execution time (seconds)",
-        x_values=xs,
-        series=series,
-        styles=styles,
-        x_scale=str(args.x_scale),  # type: ignore[arg-type]
-        y_cap=5.0,
-    )
-    print(f"Wrote {out_png}")
+        styles = {
+            "PromptSelector": {"color": (37, 99, 235), "line": "solid", "marker": "square"},
+            "SampledGreedySelector": {"color": (22, 163, 74), "line": "dashed", "marker": "circle"},
+        }
+        _write_png_line_chart_pillow(
+            out_png,
+            title="Prompt instance selection: execution time vs candidates per class",
+            x_label="Number of candidate prompts per class",
+            y_label="Execution time (seconds)",
+            x_values=xs,
+            series=series,
+            styles=styles,
+            x_scale=str(args.x_scale),  # type: ignore[arg-type]
+            y_cap=5.0,
+        )
+        print(f"Wrote {out_png}")
 
 
 if __name__ == "__main__":

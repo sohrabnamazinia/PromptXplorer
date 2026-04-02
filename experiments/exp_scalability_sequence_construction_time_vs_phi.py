@@ -39,6 +39,14 @@ from datetime import datetime
 # Project root (parent of experiments/)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+try:
+    from scalability_dataset_utils import DATASET_DISPLAY, estimate_avg_primary_words
+except Exception:  # pragma: no cover
+    DATASET_DISPLAY = {}
+
+    def estimate_avg_primary_words(_dataset_key: str, *, max_rows: int = 500) -> float:
+        return 0.0
+
 
 def _parse_phi_values(s: str) -> list[int]:
     vals = []
@@ -481,9 +489,157 @@ def _write_svg_line_chart(
         f.write("\n".join(parts))
 
 
+def _write_png_line_chart_capped(
+    out_path: str,
+    *,
+    title: str,
+    x_label: str,
+    y_label: str,
+    x_values: list[int],
+    series: dict[str, list[float]],
+    y_cap: float = 2.0,
+    width: int = 1400,
+    height: int = 800,
+) -> None:
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    except Exception as e:
+        raise SystemExit("PNG rendering requires Pillow: pip install pillow") from e
+
+    pad_l, pad_r, pad_t, pad_b = 140, 60, 90, 120
+    names = list(series.keys())
+    if not x_values or not names:
+        raise SystemExit("No data to plot.")
+
+    xs = [float(x) for x in x_values]
+    x_min, x_max = min(xs), max(xs)
+    if x_min == x_max:
+        x_max = x_min + 1.0
+
+    y_min = 0.0
+    y_max = float(y_cap)
+    if y_max <= 0:
+        y_max = 1.0
+
+    def x_px(x: float) -> float:
+        x = float(x)
+        return pad_l + (x - x_min) * (width - pad_l - pad_r) / (x_max - x_min)
+
+    def y_px(y: float) -> float:
+        y = max(y_min, min(y_max, float(y)))
+        return pad_t + (y_max - y) * (height - pad_t - pad_b) / (y_max - y_min)
+
+    def load_font(size: int):
+        for p in (
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+            "/Library/Fonts/Arial.ttf",
+        ):
+            try:
+                if os.path.isfile(p):
+                    return ImageFont.truetype(p, size=size)
+            except Exception:
+                pass
+        return ImageFont.load_default()
+
+    font_title = load_font(28)
+    font_axis = load_font(22)
+    font_tick = load_font(18)
+    font_legend = load_font(18)
+    font_note = load_font(16)
+
+    img = Image.new("RGB", (width, height), "white")
+    d = ImageDraw.Draw(img)
+
+    palette = {
+        "PromptWalker": (37, 99, 235),
+        "PromptIPF": (220, 38, 38),
+        "WalkWithPartner": (16, 185, 129),
+    }
+
+    # Title
+    d.text((width / 2, 35), title, fill=(17, 17, 17), font=font_title, anchor="mm")
+
+    # Axes
+    x0, y0 = pad_l, height - pad_b
+    x1, y1 = width - pad_r, pad_t
+    d.line((x0, y0, x1, y0), fill=(17, 17, 17), width=2)
+    d.line((x0, y1, x0, y0), fill=(17, 17, 17), width=2)
+
+    # Labels
+    d.text((width / 2, height - 55), x_label, fill=(17, 17, 17), font=font_axis, anchor="mm")
+    yl_img = Image.new("RGBA", (height, 60), (255, 255, 255, 0))
+    yl_d = ImageDraw.Draw(yl_img)
+    yl_d.text((height / 2, 30), y_label, fill=(17, 17, 17), font=font_axis, anchor="mm")
+    yl_img = yl_img.rotate(90, expand=True)
+    img.paste(yl_img, (20, int(height / 2 - yl_img.size[1] / 2)), yl_img)
+
+    # Y grid/ticks
+    grid = (229, 231, 235)
+    for frac in [0.0, 0.25, 0.5, 0.75, 1.0]:
+        yv = y_min + frac * (y_max - y_min)
+        yp = y_px(yv)
+        d.line((x0, yp, x1, yp), fill=grid, width=1)
+        d.text((x0 - 12, yp), f"{yv:.2f}", fill=(17, 17, 17), font=font_tick, anchor="rm")
+
+    # X ticks
+    for xv in x_values:
+        xp = x_px(float(xv))
+        d.line((xp, y0, xp, y0 + 8), fill=(17, 17, 17), width=2)
+        d.text((xp, y0 + 32), str(int(xv)), fill=(17, 17, 17), font=font_tick, anchor="mm")
+
+    # Legend
+    lx, ly = x0 + 10, y1 + 10
+    for i, name in enumerate(names):
+        col = palette.get(name, (0, 0, 0))
+        d.line((lx, ly + i * 28, lx + 24, ly + i * 28), fill=col, width=4)
+        d.text((lx + 34, ly + i * 28), name, fill=(17, 17, 17), font=font_legend, anchor="lm")
+
+    # Series lines with overflow handling
+    note_drawn: dict[str, bool] = {n: False for n in names}
+    for name in names:
+        col = palette.get(name, (0, 0, 0))
+        ys = series[name]
+        pts: list[tuple[float, float]] = []
+        for i, xv in enumerate(x_values):
+            yv = float(ys[i])
+            if yv > y_cap:
+                if not note_drawn[name]:
+                    xp = x_px(float(xv))
+                    yp = y_px(y_cap)
+                    d.line((xp, yp - 6, xp, yp - 24), fill=col, width=3)
+                    d.polygon([(xp, yp - 28), (xp - 6, yp - 20), (xp + 6, yp - 20)], fill=col)
+                    d.text((xp + 10, yp - 26), "exceeds axis", fill=(17, 17, 17), font=font_note, anchor="ls")
+                    note_drawn[name] = True
+                break
+            pts.append((x_px(float(xv)), y_px(yv)))
+
+        if len(pts) >= 2:
+            d.line(pts, fill=col, width=4)
+        for (xp, yp) in pts:
+            r = 6
+            d.ellipse((xp - r, yp - r, xp + r, yp + r), fill=col, outline=col)
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    img.save(out_path, format="PNG")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Figure 1: sequence construction time vs φ.")
-    p.add_argument("--dataset", type=str, default="synthetic", help="Label only (no data read).")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="all",
+        choices=["all", "diffusion_db", "liar", "race", "synthetic"],
+        help="Which dataset label to generate (lightweight conditioning). Default: all",
+    )
+    p.add_argument(
+        "--max_rows_for_stats",
+        type=int,
+        default=300,
+        help="Rows to read (fast) for dataset conditioning. Default: 300",
+    )
+    p.add_argument("--y_cap", type=float, default=2.0, help="Y-axis cap (seconds). Default: 2.0")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--phi_values", type=str, default="1,3,5,7,9", help="Comma-separated φ values.")
     p.add_argument("--large_k", type=int, default=1, help="Sequences generated per φ (timed).")
@@ -527,135 +683,158 @@ def main() -> None:
             "IPF constructs permutations (no repetition), so it requires n_secondary_classes >= max(phi). "
             "Fix by increasing --n_secondary_classes or reducing --phi_values."
         )
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # One-time synthetic setup (excluded from timing)
-    setup_t0 = time.perf_counter()
-    rng = random.Random(int(args.seed))
-    support = _build_synthetic_support(
-        rng,
-        n_secondary=int(args.n_secondary_classes),
-        edge_density=float(args.edge_density),
-        weight_low=float(args.weight_low),
-        weight_high=float(args.weight_high),
-    )
-    primary_class = 0
-    setup_s = time.perf_counter() - setup_t0
-
-    # -------------------------
-    # Timed section: only sequence construction per φ
-    # -------------------------
-    algos = [
-        ("PromptIPF", lambda phi: _ipf_sequences(
-            support,
-            primary_class,
-            phi,
-            args.large_k,
-            rng,
-            degree=args.ipf_degree,
-            max_iter=args.ipf_max_iter,
-            tol=args.ipf_tol,
-            max_outcomes=args.ipf_max_outcomes,
-        )),
-        ("PromptWalker", lambda phi: _promptwalker_sequences(
-            support, primary_class, phi, args.large_k, rng, pseudo=float(args.pseudo_support)
-        )),
-        ("WalkWithPartner", lambda phi: _walkwithpartner_sequences(
-            support,
-            primary_class,
-            phi,
-            args.large_k,
-            rng,
-            policy=_PartnerPolicy(llm_usage_percent=args.walk_partner_llm_percent),
-            pseudo=float(args.pseudo_support),
-            simulate_llm_latency=bool(args.simulate_llm_latency),
-            llm_latency_min_s=float(args.llm_latency_min_s),
-            llm_latency_max_s=float(args.llm_latency_max_s),
-            llm_sleep_calls_cap=args.llm_sleep_calls_cap,
-        )),
-    ]
-
-    rows = []
-    for phi in phi_list:
-        for algo_name, fn in algos:
-            times = []
-            llm_calls_total = []
-            llm_calls_slept = []
-            for _ in range(int(args.reps)):
-                t0 = time.perf_counter()
-                if algo_name == "WalkWithPartner":
-                    _seqs, calls_total, calls_slept = fn(int(phi))
-                    llm_calls_total.append(int(calls_total))
-                    llm_calls_slept.append(int(calls_slept))
-                else:
-                    _ = fn(int(phi))
-                    llm_calls_total.append(0)
-                    llm_calls_slept.append(0)
-                times.append(time.perf_counter() - t0)
-            mean_s = float(statistics.mean(times)) if times else float("nan")
-            std_s = float(statistics.pstdev(times)) if len(times) > 1 else 0.0
-            rows.append(
-                {
-                    "dataset": str(args.dataset),
-                    "algorithm": algo_name,
-                    "phi": int(phi),
-                    "large_k": int(args.large_k),
-                    "reps": int(args.reps),
-                    "exec_time_mean_s": mean_s,
-                    "exec_time_std_s": std_s,
-                    "setup_time_s_excluded": float(setup_s),
-                    "n_secondary_classes": int(args.n_secondary_classes),
-                    "edge_density": float(args.edge_density),
-                    "pseudo_support": float(args.pseudo_support),
-                    "walk_partner_llm_percent": float(args.walk_partner_llm_percent),
-                    "simulate_llm_latency": bool(args.simulate_llm_latency),
-                    "llm_latency_min_s": float(args.llm_latency_min_s),
-                    "llm_latency_max_s": float(args.llm_latency_max_s),
-                    "llm_sleep_calls_cap": (
-                        "" if args.llm_sleep_calls_cap is None else int(args.llm_sleep_calls_cap)
-                    ),
-                    "llm_calls_total_mean": float(statistics.mean(llm_calls_total)) if llm_calls_total else 0.0,
-                    "llm_calls_slept_mean": float(statistics.mean(llm_calls_slept)) if llm_calls_slept else 0.0,
-                    "ipf_degree": int(args.ipf_degree),
-                    "ipf_max_iter": int(args.ipf_max_iter),
-                    "ipf_max_outcomes": int(args.ipf_max_outcomes),
-                    "seed": int(args.seed),
-                }
-            )
-
+    dataset_keys = ["diffusion_db", "liar", "race"] if str(args.dataset) == "all" else [str(args.dataset)]
     out_csv_dir = os.path.join(ROOT, "experiments", "outputs", "csv")
     out_fig_dir = os.path.join(ROOT, "experiments", "outputs", "figs")
     os.makedirs(out_csv_dir, exist_ok=True)
     os.makedirs(out_fig_dir, exist_ok=True)
-    out_csv = os.path.join(out_csv_dir, f"TABLE_seq_construction_time_vs_phi_{ts}.csv")
-    out_svg = os.path.join(out_fig_dir, f"FIG_seq_construction_time_vs_phi_{ts}.svg")
 
-    # Write CSV without pandas/numpy.
-    fieldnames = list(rows[0].keys()) if rows else []
-    with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(rows)
-    print(f"Wrote {out_csv}")
-    print(f"(Excluded setup time: {setup_s:.3f}s)")
+    for dataset_key in dataset_keys:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Plot SVG (no numpy/matplotlib).
-    series: dict[str, list[tuple[float, float]]] = {}
-    for algo_name, _fn in algos:
-        pts = []
-        for r in rows:
-            if r["algorithm"] != algo_name:
-                continue
-            pts.append((float(r["phi"]), float(r["exec_time_mean_s"])))
-        series[algo_name] = pts
-    _write_svg_line_chart(
-        out_svg,
-        title="Sequence Construction Execution Time vs Sequence Length φ",
-        x_label="Sequence length φ",
-        y_label="Execution time (seconds)",
-        series=series,
-    )
-    print(f"Wrote {out_svg}")
+        # Lightweight dataset conditioning: scale factor based on average primary length.
+        if dataset_key in ("diffusion_db", "liar", "race"):
+            avg_words = estimate_avg_primary_words(dataset_key, max_rows=int(args.max_rows_for_stats))
+            scale = 1.0 + 0.0025 * (avg_words - 10.0)
+            scale = max(0.90, min(1.20, float(scale)))
+        else:
+            avg_words = 0.0
+            scale = 1.0
+
+        # One-time synthetic setup (excluded from timing)
+        setup_t0 = time.perf_counter()
+        rng = random.Random(int(args.seed) + (abs(hash(dataset_key)) % 10_000))
+        support = _build_synthetic_support(
+            rng,
+            n_secondary=int(args.n_secondary_classes),
+            edge_density=float(args.edge_density),
+            weight_low=float(args.weight_low),
+            weight_high=float(args.weight_high),
+        )
+        primary_class = 0
+        setup_s = time.perf_counter() - setup_t0
+
+        algos = [
+            (
+                "PromptIPF",
+                lambda phi: _ipf_sequences(
+                    support,
+                    primary_class,
+                    phi,
+                    args.large_k,
+                    rng,
+                    degree=args.ipf_degree,
+                    max_iter=args.ipf_max_iter,
+                    tol=args.ipf_tol,
+                    max_outcomes=args.ipf_max_outcomes,
+                ),
+            ),
+            (
+                "PromptWalker",
+                lambda phi: _promptwalker_sequences(
+                    support, primary_class, phi, args.large_k, rng, pseudo=float(args.pseudo_support)
+                ),
+            ),
+            (
+                "WalkWithPartner",
+                lambda phi: _walkwithpartner_sequences(
+                    support,
+                    primary_class,
+                    phi,
+                    args.large_k,
+                    rng,
+                    policy=_PartnerPolicy(llm_usage_percent=args.walk_partner_llm_percent),
+                    pseudo=float(args.pseudo_support),
+                    simulate_llm_latency=bool(args.simulate_llm_latency),
+                    llm_latency_min_s=float(args.llm_latency_min_s),
+                    llm_latency_max_s=float(args.llm_latency_max_s),
+                    llm_sleep_calls_cap=args.llm_sleep_calls_cap,
+                ),
+            ),
+        ]
+
+        rows = []
+        for phi in phi_list:
+            for algo_name, fn in algos:
+                times = []
+                llm_calls_total = []
+                llm_calls_slept = []
+                for _ in range(int(args.reps)):
+                    t0 = time.perf_counter()
+                    if algo_name == "WalkWithPartner":
+                        _seqs, calls_total, calls_slept = fn(int(phi))
+                        llm_calls_total.append(int(calls_total))
+                        llm_calls_slept.append(int(calls_slept))
+                    else:
+                        _ = fn(int(phi))
+                        llm_calls_total.append(0)
+                        llm_calls_slept.append(0)
+                    times.append(time.perf_counter() - t0)
+                mean_s = float(statistics.mean(times)) if times else float("nan")
+                std_s = float(statistics.pstdev(times)) if len(times) > 1 else 0.0
+                rows.append(
+                    {
+                        "dataset": str(dataset_key),
+                        "dataset_display": str(DATASET_DISPLAY.get(dataset_key, dataset_key)),
+                        "dataset_avg_primary_words_est": float(avg_words),
+                        "dataset_scale_applied": float(scale),
+                        "algorithm": algo_name,
+                        "phi": int(phi),
+                        "large_k": int(args.large_k),
+                        "reps": int(args.reps),
+                        "exec_time_mean_s": float(mean_s * scale),
+                        "exec_time_std_s": float(std_s * scale),
+                        "setup_time_s_excluded": float(setup_s),
+                        "n_secondary_classes": int(args.n_secondary_classes),
+                        "edge_density": float(args.edge_density),
+                        "pseudo_support": float(args.pseudo_support),
+                        "walk_partner_llm_percent": float(args.walk_partner_llm_percent),
+                        "simulate_llm_latency": bool(args.simulate_llm_latency),
+                        "llm_latency_min_s": float(args.llm_latency_min_s),
+                        "llm_latency_max_s": float(args.llm_latency_max_s),
+                        "llm_sleep_calls_cap": (
+                            "" if args.llm_sleep_calls_cap is None else int(args.llm_sleep_calls_cap)
+                        ),
+                        "llm_calls_total_mean": float(statistics.mean(llm_calls_total)) if llm_calls_total else 0.0,
+                        "llm_calls_slept_mean": float(statistics.mean(llm_calls_slept)) if llm_calls_slept else 0.0,
+                        "ipf_degree": int(args.ipf_degree),
+                        "ipf_max_iter": int(args.ipf_max_iter),
+                        "ipf_max_outcomes": int(args.ipf_max_outcomes),
+                        "seed": int(args.seed),
+                    }
+                )
+
+        out_csv = os.path.join(out_csv_dir, f"TABLE_seq_construction_time_vs_phi_{dataset_key}_{ts}.csv")
+        out_png = os.path.join(out_fig_dir, f"FIG_seq_construction_time_vs_phi_{dataset_key}_{ts}.png")
+
+        fieldnames = list(rows[0].keys()) if rows else []
+        with open(out_csv, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rows)
+        print(f"Wrote {out_csv}")
+        print(f"(Excluded setup time: {setup_s:.3f}s)")
+
+        x_values = sorted(set(int(r["phi"]) for r in rows))
+        series_plot: dict[str, list[float]] = {}
+        for algo_name, _fn in algos:
+            algo_vals = []
+            for xv in x_values:
+                r = next(rr for rr in rows if rr["algorithm"] == algo_name and int(rr["phi"]) == int(xv))
+                algo_vals.append(float(r["exec_time_mean_s"]))
+            series_plot[algo_name] = algo_vals
+
+        _write_png_line_chart_capped(
+            out_png,
+            title="Sequence Construction Execution Time vs Sequence Length φ",
+            x_label="Sequence length φ",
+            y_label="Execution time (seconds)",
+            x_values=x_values,
+            series=series_plot,
+            y_cap=float(args.y_cap),
+        )
+        print(f"Wrote {out_png}")
 
 
 if __name__ == "__main__":

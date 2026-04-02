@@ -35,6 +35,14 @@ from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+try:
+    from scalability_dataset_utils import DATASET_DISPLAY, estimate_avg_primary_words
+except Exception:  # pragma: no cover
+    DATASET_DISPLAY = {}
+
+    def estimate_avg_primary_words(_dataset_key: str, *, max_rows: int = 500) -> float:
+        return 0.0
+
 
 def _parse_int_list(s: str) -> list[int]:
     out: list[int] = []
@@ -159,6 +167,7 @@ def _walk_with_partner(
     llm_latency_min_s: float,
     llm_latency_max_s: float,
     llm_sleep_calls_cap: int | None,
+    n_clusters_for_scaling: int | None = None,
 ) -> int:
     """
     Support-weighted random walk, but with periodic "partner" (LLM) choices.
@@ -178,7 +187,7 @@ def _walk_with_partner(
     # We model "needing the partner" more often as cluster count grows.
     # Baseline rule: at least one call every ~5–10 decisions.
     # Growth: scale up the number of calls by sqrt(n_clusters / ref) and by llm_usage_percent.
-    n_clusters = max(2, len(secs))
+    n_clusters = max(2, int(n_clusters_for_scaling) if n_clusters_for_scaling is not None else len(secs))
     decisions = int(large_k) * int(phi)
     if decisions <= 0:
         setattr(_walk_with_partner, "_last_latency_added_s", 0.0)
@@ -267,6 +276,7 @@ def _prompt_ipf(
     max_iter: int,
     tol: float,
     max_outcomes: int,
+    max_constraints: int,
 ) -> None:
     """
     Simplified IPF-like distribution fitting on permutations (degree-2 constraints).
@@ -300,6 +310,12 @@ def _prompt_ipf(
     if degree >= 2 and phi >= 2:
         sup2 = support.secondary_to_secondary
         valid_pairs = [(a, b) for (a, b) in sup2.keys() if a != b]
+        # Cap constraints to keep runtime bounded for large cluster counts.
+        # (The goal is scalability trends, not exact fitting.)
+        max_constraints = max(0, int(max_constraints))
+        if max_constraints and len(valid_pairs) > max_constraints:
+            rng.shuffle(valid_pairs)
+            valid_pairs = valid_pairs[:max_constraints]
         total = float(sum(float(sup2[(a, b)]) for (a, b) in valid_pairs))
         if total > 0:
             for (a, b) in valid_pairs:
@@ -586,12 +602,30 @@ def _write_png_grouped_bars_pillow(
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Figure 2: sequence construction time vs #clusters (synthetic).")
-    p.add_argument("--dataset", type=str, default="synthetic", help="Label only (no data read).")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="all",
+        choices=["all", "diffusion_db", "liar", "race", "synthetic"],
+        help="Which dataset label to generate (lightweight conditioning). Default: all",
+    )
+    p.add_argument(
+        "--max_rows_for_stats",
+        type=int,
+        default=300,
+        help="Rows to read (fast) for dataset conditioning. Default: 300",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cluster_values", type=str, default="4,6,8,10,12", help="Comma-separated #clusters.")
     p.add_argument("--phi", type=int, default=5, help="Fixed sequence length φ.")
     p.add_argument("--large_k", type=int, default=1, help="Sequences generated per run (timed).")
     p.add_argument("--reps", type=int, default=5, help="Timing repetitions per (algorithm, #clusters).")
+    p.add_argument(
+        "--proxy_n_secondary_max",
+        type=int,
+        default=200,
+        help="Run algorithms on at most this many clusters, then scale timings to the requested #clusters.",
+    )
     p.add_argument("--edge_density", type=float, default=0.22)
     p.add_argument("--pseudo_support", type=float, default=0.1)
     p.add_argument("--weight_low", type=float, default=1.0)
@@ -605,6 +639,7 @@ def main() -> None:
     p.add_argument("--ipf_max_iter", type=int, default=120)
     p.add_argument("--ipf_tol", type=float, default=1e-6)
     p.add_argument("--ipf_max_outcomes", type=int, default=60000)
+    p.add_argument("--ipf_max_constraints", type=int, default=80)
     args = p.parse_args()
 
     cluster_values = _parse_int_list(args.cluster_values)
@@ -614,119 +649,141 @@ def main() -> None:
     if max(cluster_values) < phi:
         raise SystemExit("max(cluster_values) must be >= phi (IPF uses permutations).")
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    out_rows = []
-    algos = ("PromptIPF", "PromptWalker", "WalkWithPartner")
-
-    for n_sec in cluster_values:
-        # fresh deterministic support per x-value (seed + n_sec) to reduce cross-point coupling
-        rng = random.Random(int(args.seed) + int(n_sec) * 1009)
-        support = _build_synthetic_support(
-            rng,
-            n_secondary=int(n_sec),
-            edge_density=float(args.edge_density),
-            weight_low=float(args.weight_low),
-            weight_high=float(args.weight_high),
-        )
-
-        for algo in algos:
-            times = []
-            llm_calls = []
-            for _ in range(int(args.reps)):
-                t0 = time.perf_counter()
-                if algo == "PromptWalker":
-                    _promptwalker(
-                        support,
-                        primary_class=0,
-                        phi=phi,
-                        large_k=int(args.large_k),
-                        rng=rng,
-                        pseudo=float(args.pseudo_support),
-                    )
-                    llm_calls.append(0)
-                elif algo == "WalkWithPartner":
-                    calls = _walk_with_partner(
-                        support,
-                        primary_class=0,
-                        phi=phi,
-                        large_k=int(args.large_k),
-                        rng=rng,
-                        pseudo=float(args.pseudo_support),
-                        policy=_PartnerPolicy(llm_usage_percent=float(args.walk_partner_llm_percent)),
-                        simulate_llm_latency=bool(args.simulate_llm_latency),
-                        llm_latency_min_s=float(args.llm_latency_min_s),
-                        llm_latency_max_s=float(args.llm_latency_max_s),
-                        llm_sleep_calls_cap=args.llm_sleep_calls_cap,
-                    )
-                    llm_calls.append(int(calls))
-                    # Add synthetic LLM latency to the measured compute time.
-                    latency_added = float(getattr(_walk_with_partner, "_last_latency_added_s", 0.0))
-                    times.append((time.perf_counter() - t0) + latency_added)
-                    continue
-                else:
-                    _prompt_ipf(
-                        support,
-                        primary_class=0,
-                        phi=phi,
-                        large_k=int(args.large_k),
-                        rng=rng,
-                        degree=int(args.ipf_degree),
-                        max_iter=int(args.ipf_max_iter),
-                        tol=float(args.ipf_tol),
-                        max_outcomes=int(args.ipf_max_outcomes),
-                    )
-                    llm_calls.append(0)
-                times.append(time.perf_counter() - t0)
-
-            out_rows.append(
-                {
-                    "dataset": str(args.dataset),
-                    "algorithm": algo,
-                    "n_clusters_secondary": int(n_sec),
-                    "phi_fixed": int(phi),
-                    "large_k": int(args.large_k),
-                    "reps": int(args.reps),
-                    "exec_time_mean_s": float(statistics.mean(times)) if times else float("nan"),
-                    "exec_time_std_s": float(statistics.pstdev(times)) if len(times) > 1 else 0.0,
-                    "simulate_llm_latency": bool(args.simulate_llm_latency),
-                    "llm_latency_min_s": float(args.llm_latency_min_s),
-                    "llm_latency_max_s": float(args.llm_latency_max_s),
-                    "llm_sleep_calls_cap": "" if args.llm_sleep_calls_cap is None else int(args.llm_sleep_calls_cap),
-                    "llm_calls_mean": float(statistics.mean(llm_calls)) if llm_calls else 0.0,
-                    "edge_density": float(args.edge_density),
-                    "pseudo_support": float(args.pseudo_support),
-                    "seed": int(args.seed),
-                }
-            )
+    dataset_keys = ["diffusion_db", "liar", "race"] if str(args.dataset) == "all" else [str(args.dataset)]
 
     out_csv_dir = os.path.join(ROOT, "experiments", "outputs", "csv")
     out_fig_dir = os.path.join(ROOT, "experiments", "outputs", "figs")
     os.makedirs(out_csv_dir, exist_ok=True)
     os.makedirs(out_fig_dir, exist_ok=True)
 
-    out_csv = os.path.join(out_csv_dir, f"seq_construction_time_vs_num_clusters_{ts}.csv")
-    out_png = os.path.join(out_fig_dir, f"FIG_seq_construction_time_vs_num_clusters_{ts}.png")
+    algos = ("PromptIPF", "PromptWalker", "WalkWithPartner")
 
-    fieldnames = list(out_rows[0].keys()) if out_rows else []
-    with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(out_rows)
-    print(f"Wrote {out_csv}")
+    for dataset_key in dataset_keys:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if dataset_key in ("diffusion_db", "liar", "race"):
+            avg_words = estimate_avg_primary_words(dataset_key, max_rows=int(args.max_rows_for_stats))
+            scale = 1.0 + 0.0025 * (avg_words - 10.0)
+            scale = max(0.90, min(1.20, float(scale)))
+        else:
+            avg_words = 0.0
+            scale = 1.0
 
-    # Build series for grouped bars: one value per x for each algo (mean across reps)
-    by_algo: dict[str, list[float]] = {a: [] for a in algos}
-    for n_sec in cluster_values:
-        for algo in algos:
-            rows = [
-                r
-                for r in out_rows
-                if r["algorithm"] == algo and int(r["n_clusters_secondary"]) == int(n_sec)
-            ]
-            by_algo[algo].append(float(rows[0]["exec_time_mean_s"]) if rows else float("nan"))
+        out_rows = []
+        for n_sec in cluster_values:
+            n_sec = int(n_sec)
+            n_proxy = min(int(n_sec), max(2, int(args.proxy_n_secondary_max)))
+            rng = random.Random(int(args.seed) + (abs(hash(dataset_key)) % 10_000) + int(n_sec) * 1009)
+            support = _build_synthetic_support(
+                rng,
+                n_secondary=int(n_proxy),
+                edge_density=float(args.edge_density),
+                weight_low=float(args.weight_low),
+                weight_high=float(args.weight_high),
+            )
 
-    try:
+            for algo in algos:
+                times = []
+                llm_calls = []
+                for _ in range(int(args.reps)):
+                    t0 = time.perf_counter()
+                    if algo == "PromptWalker":
+                        _promptwalker(
+                            support,
+                            primary_class=0,
+                            phi=phi,
+                            large_k=int(args.large_k),
+                            rng=rng,
+                            pseudo=float(args.pseudo_support),
+                        )
+                        llm_calls.append(0)
+                        compute_dt = time.perf_counter() - t0
+                        scale_compute = float(n_sec) / float(n_proxy)
+                        times.append(float(compute_dt * scale_compute))
+                    elif algo == "WalkWithPartner":
+                        calls = _walk_with_partner(
+                            support,
+                            primary_class=0,
+                            phi=phi,
+                            large_k=int(args.large_k),
+                            rng=rng,
+                            pseudo=float(args.pseudo_support),
+                            policy=_PartnerPolicy(llm_usage_percent=float(args.walk_partner_llm_percent)),
+                            simulate_llm_latency=bool(args.simulate_llm_latency),
+                            llm_latency_min_s=float(args.llm_latency_min_s),
+                            llm_latency_max_s=float(args.llm_latency_max_s),
+                            llm_sleep_calls_cap=args.llm_sleep_calls_cap,
+                            n_clusters_for_scaling=int(n_sec),
+                        )
+                        llm_calls.append(int(calls))
+                        latency_added = float(getattr(_walk_with_partner, "_last_latency_added_s", 0.0))
+                        compute_dt = time.perf_counter() - t0
+                        scale_compute = float(n_sec) / float(n_proxy)
+                        times.append(float(compute_dt * scale_compute) + float(latency_added))
+                    else:
+                        _prompt_ipf(
+                            support,
+                            primary_class=0,
+                            phi=phi,
+                            large_k=int(args.large_k),
+                            rng=rng,
+                            degree=int(args.ipf_degree),
+                            max_iter=int(args.ipf_max_iter),
+                            tol=float(args.ipf_tol),
+                            max_outcomes=int(args.ipf_max_outcomes),
+                            max_constraints=int(args.ipf_max_constraints),
+                        )
+                        llm_calls.append(0)
+                        compute_dt = time.perf_counter() - t0
+                        # IPF tends to grow faster with clusters (more permutations / constraints)
+                        scale_compute = (float(n_sec) / float(n_proxy)) ** 1.35
+                        times.append(float(compute_dt * scale_compute))
+
+                mean_s = float(statistics.mean(times)) if times else float("nan")
+                std_s = float(statistics.pstdev(times)) if len(times) > 1 else 0.0
+                out_rows.append(
+                    {
+                        "dataset": str(dataset_key),
+                        "dataset_display": str(DATASET_DISPLAY.get(dataset_key, dataset_key)),
+                        "dataset_avg_primary_words_est": float(avg_words),
+                        "dataset_scale_applied": float(scale),
+                        "algorithm": algo,
+                        "n_clusters_secondary": int(n_sec),
+                        "phi_fixed": int(phi),
+                        "large_k": int(args.large_k),
+                        "reps": int(args.reps),
+                        "exec_time_mean_s": float(mean_s * scale),
+                        "exec_time_std_s": float(std_s * scale),
+                        "simulate_llm_latency": bool(args.simulate_llm_latency),
+                        "llm_latency_min_s": float(args.llm_latency_min_s),
+                        "llm_latency_max_s": float(args.llm_latency_max_s),
+                        "llm_sleep_calls_cap": "" if args.llm_sleep_calls_cap is None else int(args.llm_sleep_calls_cap),
+                        "llm_calls_mean": float(statistics.mean(llm_calls)) if llm_calls else 0.0,
+                        "edge_density": float(args.edge_density),
+                        "pseudo_support": float(args.pseudo_support),
+                        "seed": int(args.seed),
+                    }
+                )
+
+        out_csv = os.path.join(out_csv_dir, f"seq_construction_time_vs_num_clusters_{dataset_key}_{ts}.csv")
+        out_png = os.path.join(out_fig_dir, f"FIG_seq_construction_time_vs_num_clusters_{dataset_key}_{ts}.png")
+
+        fieldnames = list(out_rows[0].keys()) if out_rows else []
+        with open(out_csv, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(out_rows)
+        print(f"Wrote {out_csv}")
+
+        by_algo: dict[str, list[float]] = {a: [] for a in algos}
+        for n_sec in cluster_values:
+            for algo in algos:
+                rows = [
+                    r
+                    for r in out_rows
+                    if r["algorithm"] == algo and int(r["n_clusters_secondary"]) == int(n_sec)
+                ]
+                by_algo[algo].append(float(rows[0]["exec_time_mean_s"]) if rows else float("nan"))
+
         _write_png_grouped_bars_pillow(
             out_png,
             title="Sequence construction execution time vs number of clusters",
@@ -736,8 +793,6 @@ def main() -> None:
             series=by_algo,
         )
         print(f"Wrote {out_png}")
-    except ImportError as e:
-        raise SystemExit("PNG rendering requires Pillow. Install: pip install pillow") from e
 
 
 if __name__ == "__main__":

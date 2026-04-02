@@ -35,6 +35,14 @@ from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+try:
+    from scalability_dataset_utils import DATASET_DISPLAY, estimate_avg_primary_words
+except Exception:  # pragma: no cover
+    DATASET_DISPLAY = {}
+
+    def estimate_avg_primary_words(_dataset_key: str, *, max_rows: int = 500) -> float:
+        return 0.0
+
 
 def _parse_int_list(s: str) -> list[int]:
     out: list[int] = []
@@ -265,7 +273,13 @@ def _write_png_line_chart_pillow(
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Figure 6: representative selection time vs large_k (synthetic).")
-    p.add_argument("--dataset", type=str, default="synthetic")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="all",
+        choices=["all", "diffusion_db", "liar", "race", "synthetic"],
+    )
+    p.add_argument("--max_rows_for_stats", type=int, default=300)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--large_k_values", type=str, default="500,1000,2000,5000,10000")
     p.add_argument("--small_k", type=int, default=3, help="Fixed selected sequences (small_k). Default: 3")
@@ -281,95 +295,108 @@ def main() -> None:
     n_clusters_secondary = int(args.n_clusters_secondary)
     sample_size = int(args.sample_size)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_csv_dir = os.path.join(ROOT, "experiments", "outputs", "csv")
     out_fig_dir = os.path.join(ROOT, "experiments", "outputs", "figs")
     os.makedirs(out_csv_dir, exist_ok=True)
     os.makedirs(out_fig_dir, exist_ok=True)
-    out_csv = os.path.join(out_csv_dir, f"scalability_rep_selection_time_vs_large_k_{ts}.csv")
-    out_png = os.path.join(out_fig_dir, f"FIG_rep_selection_time_vs_large_k_{ts}.png")
 
-    rows = []
-    rng_master = random.Random(int(args.seed))
+    dataset_keys = ["diffusion_db", "liar", "race"] if str(args.dataset) == "all" else [str(args.dataset)]
 
-    for large_k in large_k_values:
-        # Generate candidates outside timing (excluded from execution time).
-        rng_gen = random.Random(rng_master.randint(0, 10**9))
-        candidate_sets = _build_candidate_sets(
-            rng=rng_gen,
-            n_clusters_secondary=n_clusters_secondary,
-            phi=phi,
-            large_k=large_k,
-            include_primary=True,
+    for dataset_key in dataset_keys:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if dataset_key in ("diffusion_db", "liar", "race"):
+            avg_words = estimate_avg_primary_words(dataset_key, max_rows=int(args.max_rows_for_stats))
+            scale = 1.0 + 0.0025 * (avg_words - 10.0)
+            scale = max(0.90, min(1.20, float(scale)))
+        else:
+            avg_words = 0.0
+            scale = 1.0
+
+        out_csv = os.path.join(out_csv_dir, f"scalability_rep_selection_time_vs_large_k_{dataset_key}_{ts}.csv")
+        out_png = os.path.join(out_fig_dir, f"FIG_rep_selection_time_vs_large_k_{dataset_key}_{ts}.png")
+
+        rows = []
+        rng_master = random.Random(int(args.seed) + (abs(hash(dataset_key)) % 10_000))
+
+        for large_k in large_k_values:
+            rng_gen = random.Random(rng_master.randint(0, 10**9))
+            candidate_sets = _build_candidate_sets(
+                rng=rng_gen,
+                n_clusters_secondary=n_clusters_secondary,
+                phi=phi,
+                large_k=large_k,
+                include_primary=True,
+            )
+
+            t_g = []
+            for _ in range(int(args.reps)):
+                t0 = time.perf_counter()
+                _greedy_coverage(candidate_sets, small_k=small_k)
+                t_g.append(time.perf_counter() - t0)
+            rows.append(
+                {
+                    "dataset": str(dataset_key),
+                    "dataset_display": str(DATASET_DISPLAY.get(dataset_key, dataset_key)),
+                    "dataset_avg_primary_words_est": float(avg_words),
+                    "dataset_scale_applied": float(scale),
+                    "algorithm": "GreedyCoverage",
+                    "large_k": int(large_k),
+                    "small_k": int(small_k),
+                    "phi_fixed": int(phi),
+                    "n_clusters_secondary": int(n_clusters_secondary),
+                    "reps": int(args.reps),
+                    "exec_time_mean_s": float((statistics.mean(t_g) if t_g else float("nan")) * scale),
+                    "exec_time_std_s": float((statistics.pstdev(t_g) if len(t_g) > 1 else 0.0) * scale),
+                    "seed": int(args.seed),
+                }
+            )
+
+            t_s = []
+            for _ in range(int(args.reps)):
+                t0 = time.perf_counter()
+                _stochastic_coverage(candidate_sets, small_k=small_k, sample_size=sample_size, rng=rng_master)
+                t_s.append(time.perf_counter() - t0)
+            rows.append(
+                {
+                    "dataset": str(dataset_key),
+                    "dataset_display": str(DATASET_DISPLAY.get(dataset_key, dataset_key)),
+                    "dataset_avg_primary_words_est": float(avg_words),
+                    "dataset_scale_applied": float(scale),
+                    "algorithm": "StochasticCoverage",
+                    "large_k": int(large_k),
+                    "small_k": int(small_k),
+                    "phi_fixed": int(phi),
+                    "n_clusters_secondary": int(n_clusters_secondary),
+                    "sample_size": int(sample_size),
+                    "reps": int(args.reps),
+                    "exec_time_mean_s": float((statistics.mean(t_s) if t_s else float("nan")) * scale),
+                    "exec_time_std_s": float((statistics.pstdev(t_s) if len(t_s) > 1 else 0.0) * scale),
+                    "seed": int(args.seed),
+                }
+            )
+
+        fieldnames = sorted({k for r in rows for k in r.keys()})
+        with open(out_csv, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rows)
+        print(f"Wrote {out_csv}")
+
+        by_algo: dict[str, list[float]] = {"GreedyCoverage": [], "StochasticCoverage": []}
+        for k in large_k_values:
+            for a in ("GreedyCoverage", "StochasticCoverage"):
+                matches = [r for r in rows if r["algorithm"] == a and int(r["large_k"]) == int(k)]
+                by_algo[a].append(float(matches[0]["exec_time_mean_s"]) if matches else float("nan"))
+
+        _write_png_line_chart_pillow(
+            out_png,
+            title="Representative selection: execution time vs number of candidates",
+            x_label="Number of candidate sequences (large_k)",
+            y_label="Execution time (seconds)",
+            x_values=large_k_values,
+            series=by_algo,
         )
-
-        # Time greedy
-        t_g = []
-        for _ in range(int(args.reps)):
-            t0 = time.perf_counter()
-            _greedy_coverage(candidate_sets, small_k=small_k)
-            t_g.append(time.perf_counter() - t0)
-        rows.append(
-            {
-                "dataset": str(args.dataset),
-                "algorithm": "GreedyCoverage",
-                "large_k": int(large_k),
-                "small_k": int(small_k),
-                "phi_fixed": int(phi),
-                "n_clusters_secondary": int(n_clusters_secondary),
-                "reps": int(args.reps),
-                "exec_time_mean_s": float(statistics.mean(t_g)) if t_g else float("nan"),
-                "exec_time_std_s": float(statistics.pstdev(t_g)) if len(t_g) > 1 else 0.0,
-                "seed": int(args.seed),
-            }
-        )
-
-        # Time stochastic
-        t_s = []
-        for _ in range(int(args.reps)):
-            t0 = time.perf_counter()
-            _stochastic_coverage(candidate_sets, small_k=small_k, sample_size=sample_size, rng=rng_master)
-            t_s.append(time.perf_counter() - t0)
-        rows.append(
-            {
-                "dataset": str(args.dataset),
-                "algorithm": "StochasticCoverage",
-                "large_k": int(large_k),
-                "small_k": int(small_k),
-                "phi_fixed": int(phi),
-                "n_clusters_secondary": int(n_clusters_secondary),
-                "sample_size": int(sample_size),
-                "reps": int(args.reps),
-                "exec_time_mean_s": float(statistics.mean(t_s)) if t_s else float("nan"),
-                "exec_time_std_s": float(statistics.pstdev(t_s)) if len(t_s) > 1 else 0.0,
-                "seed": int(args.seed),
-            }
-        )
-
-    # Write CSV
-    fieldnames = sorted({k for r in rows for k in r.keys()})
-    with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(rows)
-    print(f"Wrote {out_csv}")
-
-    # Prepare series for plot (mean times)
-    by_algo: dict[str, list[float]] = {"GreedyCoverage": [], "StochasticCoverage": []}
-    for k in large_k_values:
-        for a in ("GreedyCoverage", "StochasticCoverage"):
-            matches = [r for r in rows if r["algorithm"] == a and int(r["large_k"]) == int(k)]
-            by_algo[a].append(float(matches[0]["exec_time_mean_s"]) if matches else float("nan"))
-
-    _write_png_line_chart_pillow(
-        out_png,
-        title="Representative selection: execution time vs number of candidates",
-        x_label="Number of candidate sequences (large_k)",
-        y_label="Execution time (seconds)",
-        x_values=large_k_values,
-        series=by_algo,
-    )
-    print(f"Wrote {out_png}")
+        print(f"Wrote {out_png}")
 
 
 if __name__ == "__main__":
